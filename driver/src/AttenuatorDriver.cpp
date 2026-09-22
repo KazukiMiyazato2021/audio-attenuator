@@ -35,11 +35,21 @@ static const UInt32 kBitsPerChannel     = 32;
 static const UInt32 kBytesPerFrame      = kNumChannels * sizeof(Float32);
 static const UInt32 kBufferFrameSize    = 512;
 static const UInt32 kRingBufferFrames   = 65536;
+// How far behind the writer the reader is placed on resync: two IO periods
+// (~21ms at 48kHz), enough slack for IO-cycle jitter without adding audible lag.
+static const UInt32 kResyncSafetyFrames = 2 * kBufferFrameSize;
 
 // Ring buffer for loopback
 static Float32 gRingBuffer[kRingBufferFrames * kNumChannels] = {};
 static volatile UInt32 gRingWritePos = 0;
 static volatile UInt32 gRingReadPos  = 0;
+// Set whenever a client starts IO (including a reader attaching after a
+// writer has already been running); consumed on the next ReadInput call to
+// snap the read position to the current write position. Without this, a
+// reader that attaches after audio has already been flowing would start by
+// draining stale, already-buffered audio instead of the live signal —
+// audible as a fixed startup lag up to the ring buffer's ~1.36s capacity.
+static volatile UInt32 gNeedInputResync = 1;
 
 // Driver state
 static AudioServerPlugInHostRef gPlugIn_Host = NULL;
@@ -1036,6 +1046,10 @@ static OSStatus Attenuator_StartIO(AudioServerPlugInDriverRef d, AudioObjectID d
         gRingReadPos = 0;
         LOG("StartIO");
     }
+    // Any client (re)starting IO — not just the very first one overall —
+    // should resync the reader to "live" rather than replay whatever
+    // backlog has piled up since the last time something read.
+    gNeedInputResync = 1;
     gDevice.ioRunning++;
     pthread_mutex_unlock(&gDevice.mutex);
     return kAudioHardwareNoError;
@@ -1107,6 +1121,18 @@ static OSStatus Attenuator_DoIOOperation(AudioServerPlugInDriverRef d, AudioObje
         }
         gRingWritePos = (writePos + sampleCount) % ringSize;
     } else if (operationID == kAudioServerPlugInIOOperationReadInput && streamID == kObjectID_Stream_Input) {
+        if (gNeedInputResync) {
+            // Place the reader just *behind* the writer, not level with it.
+            // readPos == writePos would point at the slot the writer has yet
+            // to fill, so the reader would serve data from a full lap ago —
+            // a fixed ~1.37s (kRingBufferFrames / kSampleRate) of latency.
+            // Backing off by a couple of IO periods reads the freshest
+            // written audio while still leaving slack for scheduling jitter
+            // between the writer's and reader's IO cycles.
+            UInt32 margin = kResyncSafetyFrames * kNumChannels;
+            gRingReadPos = (gRingWritePos + ringSize - margin) % ringSize;
+            gNeedInputResync = 0;
+        }
         UInt32 readPos = gRingReadPos;
         for (UInt32 i = 0; i < sampleCount; i++) {
             buffer[i] = gRingBuffer[(readPos + i) % ringSize];
