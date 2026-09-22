@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.audioattenuator.agent</string>
+
+    <!-- Launching through launchd is not just for autostart: a process started
+         from a terminal inherits that terminal as its TCC "responsible"
+         process, so the AudioCapture permission gets attributed to the
+         terminal instead of to Attenuator and process taps silently return
+         silence. A launchd-started agent is its own responsible process, so
+         the permission granted to Attenuator actually applies. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Attenuator.app/Contents/MacOS/AttenuatorAgent</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on crash, but respect a clean quit from the menu bar. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/attenuator-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/attenuator-agent.log</string>
+</dict>
+</plist>

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+
+    <key>CFBundleExecutable</key>
+    <string>AttenuatorAgent</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>com.audioattenuator.agent</string>
+
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <key>CFBundleName</key>
+    <string>Attenuator</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <key>LSMinimumSystemVersion</key>
+    <string>14.4</string>
+
+    <!-- Menu-bar agent: no Dock icon, no main window. -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- Required for Core Audio process taps. Without a bundle identity and
+         this usage string, macOS does not attribute the AudioCapture TCC
+         request to this app: taps still get created successfully but deliver
+         silence, with tccd logging kTCCServiceAudioCapture authValue=1. -->
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Attenuator needs to capture each app's audio so it can apply a separate volume to each one before playback.</string>
+
+    <!-- Some macOS versions group system-audio capture with screen recording;
+         included so the permission can be attributed either way. -->
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Attenuator needs system audio access to apply per-app volume.</string>
+</dict>
+</plist>

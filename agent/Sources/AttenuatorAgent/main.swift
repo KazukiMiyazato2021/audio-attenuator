@@ -8,209 +8,52 @@ import Foundation
 // otherwise be block-buffered and lost).
 setvbuf(stdout, nil, _IONBF, 0)
 
-// MARK: - Constants
-
-let kAttenuatorDeviceUID = "com.audioattenuator.device.v001"
-let kSystemObject = AudioObjectID(kAudioObjectSystemObject)
-let kChannels: UInt32 = 2
-let kSampleRate: Float64 = 48000.0
-let kRingBufferFrames = 65536
-
-// MARK: - CoreAudio helpers
-
-func cfStringToSwift(_ ref: CFString?) -> String {
-    guard let ref else { return "" }
-    return ref as String
-}
-
-func getDeviceName(_ deviceID: AudioObjectID) -> String {
-    var address = AudioObjectPropertyAddress(
-        mSelector: kAudioObjectPropertyName,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    var name: CFString? = nil
-    var size = UInt32(MemoryLayout<CFString?>.size)
-    let status = withUnsafeMutablePointer(to: &name) {
-        AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, $0)
-    }
-    guard status == noErr else { return "?" }
-    return cfStringToSwift(name)
-}
-
-func getDeviceUID(_ deviceID: AudioObjectID) -> String {
-    var address = AudioObjectPropertyAddress(
-        mSelector: kAudioDevicePropertyDeviceUID,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    var uid: CFString? = nil
-    var size = UInt32(MemoryLayout<CFString?>.size)
-    let status = withUnsafeMutablePointer(to: &uid) {
-        AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, $0)
-    }
-    guard status == noErr else { return "" }
-    return cfStringToSwift(uid)
-}
-
-func deviceHasStreams(_ deviceID: AudioObjectID, scope: AudioObjectPropertyScope) -> Bool {
-    var address = AudioObjectPropertyAddress(
-        mSelector: kAudioDevicePropertyStreams,
-        mScope: scope,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    var size: UInt32 = 0
-    let status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
-    return status == noErr && size > 0
-}
-
-func getTransportType(_ deviceID: AudioObjectID) -> UInt32 {
-    var address = AudioObjectPropertyAddress(
-        mSelector: kAudioDevicePropertyTransportType,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    var transportType: UInt32 = 0
-    var size = UInt32(MemoryLayout<UInt32>.size)
-    _ = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transportType)
-    return transportType
-}
-
-func allDeviceIDs() -> [AudioObjectID] {
-    var address = AudioObjectPropertyAddress(
-        mSelector: kAudioHardwarePropertyDevices,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    var size: UInt32 = 0
-    guard AudioObjectGetPropertyDataSize(kSystemObject, &address, 0, nil, &size) == noErr else {
-        return []
-    }
-    let count = Int(size) / MemoryLayout<AudioObjectID>.size
-    var ids = [AudioObjectID](repeating: 0, count: count)
-    guard AudioObjectGetPropertyData(kSystemObject, &address, 0, nil, &size, &ids) == noErr else {
-        return []
-    }
-    return ids
-}
-
-struct OutputDeviceInfo {
-    let deviceID: AudioObjectID
-    let name: String
-    let uid: String
-    let isVirtual: Bool
-}
-
-func listOutputDevices() -> [OutputDeviceInfo] {
-    allDeviceIDs()
-        .filter { deviceHasStreams($0, scope: kAudioObjectPropertyScopeOutput) }
-        .map { id in
-            OutputDeviceInfo(
-                deviceID: id,
-                name: getDeviceName(id),
-                uid: getDeviceUID(id),
-                isVirtual: getTransportType(id) == kAudioDeviceTransportTypeVirtual
-            )
-        }
-}
-
-func findDeviceByUID(_ uid: String) -> AudioObjectID? {
-    var address = AudioObjectPropertyAddress(
-        mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    var uidRef: CFString = uid as CFString
-    var deviceID: AudioObjectID = kAudioObjectUnknown
-    var size = UInt32(MemoryLayout<AudioObjectID>.size)
-    let status = withUnsafeMutablePointer(to: &uidRef) { uidPtr -> OSStatus in
-        withUnsafeMutablePointer(to: &deviceID) { devPtr in
-            AudioObjectGetPropertyData(kSystemObject, &address, UInt32(MemoryLayout<CFString>.size), uidPtr, &size, devPtr)
-        }
-    }
-    guard status == noErr, deviceID != kAudioObjectUnknown else { return nil }
-    return deviceID
-}
-
-/// Reads channel count + sample rate of a device's first stream in the given scope.
-func queryStreamFormat(_ deviceID: AudioObjectID, scope: AudioObjectPropertyScope) -> AudioStreamBasicDescription? {
-    var streamsAddr = AudioObjectPropertyAddress(
-        mSelector: kAudioDevicePropertyStreams,
-        mScope: scope,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    var size: UInt32 = 0
-    guard AudioObjectGetPropertyDataSize(deviceID, &streamsAddr, 0, nil, &size) == noErr, size >= UInt32(MemoryLayout<AudioObjectID>.size) else {
-        return nil
-    }
-    let count = Int(size) / MemoryLayout<AudioObjectID>.size
-    var streamIDs = [AudioObjectID](repeating: 0, count: count)
-    guard AudioObjectGetPropertyData(deviceID, &streamsAddr, 0, nil, &size, &streamIDs) == noErr, let firstStream = streamIDs.first else {
-        return nil
-    }
-
-    var formatAddr = AudioObjectPropertyAddress(
-        mSelector: kAudioStreamPropertyVirtualFormat,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    var format = AudioStreamBasicDescription()
-    var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-    guard AudioObjectGetPropertyData(firstStream, &formatAddr, 0, nil, &formatSize, &format) == noErr else {
-        return nil
-    }
-    return format
-}
-
-func trySetNominalSampleRate(_ deviceID: AudioObjectID, rate: Float64) {
-    var address = AudioObjectPropertyAddress(
-        mSelector: kAudioDevicePropertyNominalSampleRate,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMain
-    )
-    var current: Float64 = 0
-    var size = UInt32(MemoryLayout<Float64>.size)
-    guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &current) == noErr else { return }
-    guard abs(current - rate) > 0.5 else { return }
-
-    var newRate = rate
-    let status = AudioObjectSetPropertyData(deviceID, &address, 0, nil, UInt32(MemoryLayout<Float64>.size), &newRate)
-    if status != noErr {
-        FileHandle.standardError.write("Warning: could not set nominal sample rate to \(rate) Hz on device (status \(status)); leaving at \(current) Hz.\n".data(using: .utf8)!)
-    }
-}
-
 // MARK: - CLI
 
 func printUsage() {
     print("""
     Usage: AttenuatorAgent [options]
 
-    Phase 2 smoke test: reads whatever apps write to the Attenuator Device
-    (virtual output) and forwards it to a real output device, unmodified.
-    No per-app volume control yet (that's Phase 3).
+    Routes audio sent to the Attenuator Device out to a real output device,
+    applying an independent volume to each app you choose to tap. Apps you do
+    not tap keep playing through the fallback path at the fallback gain, so
+    nothing is ever silently dropped.
 
     Options:
       --list-devices        List output-capable devices and exit
-      --output <uid|name>   Real output device to forward audio to
-                             (defaults to the only non-virtual output device,
-                             if exactly one is found)
-      --source <uid>        Virtual device to capture from instead of the
-                             Attenuator Device (for A/B latency comparisons
-                             against other virtual drivers, e.g. BlackHole)
-      --duration <seconds>  Stop automatically after N seconds (0 = run until Ctrl+C, default)
-      --diag                Log ring buffer backlog and silence->sound onset
-                             timestamps. Adds per-sample scanning and printing
-                             inside the audio callbacks, which is not
-                             real-time safe — use for measurement only.
+      --list-apps           List audio-producing processes and exit
+      --tap <bundle>=<pct>  Give one app its own volume, 0-150 (repeatable).
+                             e.g. --tap com.google.Chrome.beta=30
+      --fallback <pct>      Volume for every app that is not tapped (default 100)
+      --master <pct>        Overall volume applied to the final mix (default 100)
+      --output <uid|name>   Real output device to play the mix through
+                             (defaults to the only non-virtual output device)
+      --source <uid>        Capture from this device instead of the Attenuator
+                             Device (for A/B comparisons against other drivers)
+      --duration <seconds>  Stop automatically after N seconds (0 = until Ctrl+C)
+      --diag                Log ring backlogs and silence->sound onsets. Adds
+                             per-sample scanning and printing inside the audio
+                             callbacks, which is not real-time safe — for
+                             measurement runs only.
       --help                Show this message
     """)
+}
+
+func parsePercent(_ raw: String, label: String) -> Float {
+    guard let pct = Float(raw), pct >= 0, pct <= 150 else {
+        FileHandle.standardError.write("Invalid \(label) '\(raw)': expected a number between 0 and 150.\n".data(using: .utf8)!)
+        exit(1)
+    }
+    return pct / 100.0
 }
 
 var outputArg: String? = nil
 var sourceArg: String? = nil
 var duration: Double = 0
 var diagEnabled = false
+var fallbackGain: Float = 1.0
+var masterGain: Float = 1.0
+var requestedTaps: [(bundleID: String, gain: Float)] = []
 
 var args = Array(CommandLine.arguments.dropFirst())
 var i = 0
@@ -222,6 +65,29 @@ while i < args.count {
             print("\(d.name)\t\(d.uid)\(tag)")
         }
         exit(0)
+    case "--list-apps":
+        for p in ProcessRegistry.outputCapable() {
+            let mark = p.isRunningOutput ? "  <-- playing now" : ""
+            print("\(p.bundleID)\tpid=\(p.pid)\t\(p.displayName)\(mark)")
+        }
+        exit(0)
+    case "--tap":
+        i += 1
+        guard i < args.count else { printUsage(); exit(1) }
+        let parts = args[i].split(separator: "=", maxSplits: 1)
+        guard parts.count == 2 else {
+            FileHandle.standardError.write("--tap expects <bundleID>=<percent>, got '\(args[i])'.\n".data(using: .utf8)!)
+            exit(1)
+        }
+        requestedTaps.append((String(parts[0]), parsePercent(String(parts[1]), label: "tap volume")))
+    case "--fallback":
+        i += 1
+        guard i < args.count else { printUsage(); exit(1) }
+        fallbackGain = parsePercent(args[i], label: "fallback volume")
+    case "--master":
+        i += 1
+        guard i < args.count else { printUsage(); exit(1) }
+        masterGain = parsePercent(args[i], label: "master volume")
     case "--output":
         i += 1
         guard i < args.count else { printUsage(); exit(1) }
@@ -250,189 +116,151 @@ while i < args.count {
 // MARK: - Resolve devices
 
 let sourceUID = sourceArg ?? kAttenuatorDeviceUID
-guard let attenuatorDeviceID = findDeviceByUID(sourceUID) else {
+guard let fallbackDeviceID = findDeviceByUID(sourceUID) else {
     FileHandle.standardError.write("Source device not found (UID \(sourceUID)). Is the driver installed? See scripts/install.sh.\n".data(using: .utf8)!)
     exit(1)
 }
-print("Found source device: AudioObjectID \(attenuatorDeviceID) (UID \(sourceUID))")
+print("Source device: AudioObjectID \(fallbackDeviceID) (UID \(sourceUID))")
 
 let outputDevices = listOutputDevices()
-var realOutputID: AudioObjectID? = nil
+var resolvedOutput: AudioObjectID? = nil
 
 if let outputArg {
-    realOutputID = outputDevices.first { $0.uid == outputArg || $0.name == outputArg || $0.name.contains(outputArg) }?.deviceID
-    if realOutputID == nil {
+    resolvedOutput = outputDevices.first { $0.uid == outputArg || $0.name == outputArg || $0.name.contains(outputArg) }?.deviceID
+    if resolvedOutput == nil {
         FileHandle.standardError.write("No output device matching '\(outputArg)'. Use --list-devices to see options.\n".data(using: .utf8)!)
         exit(1)
     }
 } else {
     let nonVirtual = outputDevices.filter { !$0.isVirtual }
     if nonVirtual.count == 1 {
-        realOutputID = nonVirtual[0].deviceID
+        resolvedOutput = nonVirtual[0].deviceID
         print("Defaulting to the only non-virtual output device: \(nonVirtual[0].name)")
     } else {
-        FileHandle.standardError.write("Multiple (or zero) non-virtual output devices found; pass --output explicitly. Use --list-devices to see options.\n".data(using: .utf8)!)
+        FileHandle.standardError.write("Multiple (or zero) non-virtual output devices found; pass --output explicitly.\n".data(using: .utf8)!)
         for d in nonVirtual { FileHandle.standardError.write("  \(d.name)\t\(d.uid)\n".data(using: .utf8)!) }
         exit(1)
     }
 }
 
-guard let outputDeviceID = realOutputID else { exit(1) }
-print("Forwarding to real output device: \(getDeviceName(outputDeviceID))")
+guard let outputDeviceID = resolvedOutput else { exit(1) }
+print("Output device: \(getDeviceName(outputDeviceID))")
 
-// Sanity-check the Attenuator Device's format (should always be 48kHz/stereo/Float32 per the driver).
-if let inFormat = queryStreamFormat(attenuatorDeviceID, scope: kAudioObjectPropertyScopeInput) {
-    print("Attenuator Device input format: \(inFormat.mChannelsPerFrame)ch @ \(inFormat.mSampleRate)Hz")
-}
-
-// Try to align the real device's nominal rate with our fixed internal 48kHz pipeline.
-// Known Phase 2 limitation: if the device refuses (e.g. it's shared/locked, or doesn't
-// support 48kHz), audio will still play but pitch/speed will be off until a proper
-// AudioConverter-based resampling stage is added (see plan §3/§8 risk 6).
 trySetNominalSampleRate(outputDeviceID, rate: kSampleRate)
 
 guard let outFormat = queryStreamFormat(outputDeviceID, scope: kAudioObjectPropertyScopeOutput) else {
     FileHandle.standardError.write("Could not read output device's stream format.\n".data(using: .utf8)!)
     exit(1)
 }
-print("Real output device format: \(outFormat.mChannelsPerFrame)ch @ \(outFormat.mSampleRate)Hz")
+print("Output format: \(outFormat.mChannelsPerFrame)ch @ \(outFormat.mSampleRate)Hz")
 
 let outChannels = Int(outFormat.mChannelsPerFrame)
 let outIsFloat = (outFormat.mFormatID == kAudioFormatLinearPCM) && (outFormat.mFormatFlags & kAudioFormatFlagIsFloat) != 0
 let outIsInterleaved = (outFormat.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
 
 if !outIsFloat || !outIsInterleaved || outChannels < 2 {
-    FileHandle.standardError.write("Real output device format is not interleaved Float32 with >=2 channels; Phase 2 only supports the common case. Got channels=\(outChannels) float=\(outIsFloat) interleaved=\(outIsInterleaved).\n".data(using: .utf8)!)
+    FileHandle.standardError.write("Output device format unsupported: needs interleaved Float32 with >=2 channels (got channels=\(outChannels) float=\(outIsFloat) interleaved=\(outIsInterleaved)).\n".data(using: .utf8)!)
     exit(1)
 }
 
-// MARK: - Ring buffer + IOProcs
+// MARK: - Set up taps
 
-guard let ringBuffer = catt_ring_buffer_create(kRingBufferFrames, Int(kChannels)) else {
-    FileHandle.standardError.write("Failed to allocate ring buffer.\n".data(using: .utf8)!)
-    exit(1)
-}
-defer { catt_ring_buffer_destroy(ringBuffer) }
-
-var captureProcID: AudioDeviceIOProcID? = nil
-var playbackProcID: AudioDeviceIOProcID? = nil
-
-// Onset (silence -> sound) timestamp logging, to bisect where added latency
-// comes from: a small, stable gap between "capture onset" and "playback
-// onset" means the relay itself (ring buffer + IOProcs) is fine and the
-// delay is happening upstream (driver or app-side routing); a large gap
-// there would point at the relay itself.
-//
-// NOT real-time safe: scans every sample and calls print() (which allocates
-// and does I/O) from the audio thread. Enabled only under --diag, for
-// measurement runs like scripts/measure-onset-latency.sh — never in normal
-// operation, where the IOProcs must stay allocation- and lock-free.
-final class OnsetTracker: @unchecked Sendable {
-    private var wasSilent = true
-    private let label: String
-    private let threshold: Float32 = 0.01
-    init(label: String) { self.label = label }
-    func check(_ samples: UnsafePointer<Float32>, count: Int) {
-        var peak: Float32 = 0
-        for i in 0..<count { peak = max(peak, abs(samples[i])) }
-        let isSilent = peak < threshold
-        if wasSilent && !isSilent {
-            let t = Date().timeIntervalSince1970
-            print(String(format: "[diag] %@ onset at %.3f (peak=%.3f)", label, t, peak))
-        }
-        wasSilent = isSilent
+let tapManager = TapManager()
+if !requestedTaps.isEmpty {
+    do {
+        try tapManager.setup(selectors: requestedTaps.map(\.bundleID))
+    } catch {
+        FileHandle.standardError.write("Tap setup failed: \(error)\n".data(using: .utf8)!)
+        exit(1)
     }
-}
-let captureOnset = diagEnabled ? OnsetTracker(label: "capture") : nil
-let playbackOnset = diagEnabled ? OnsetTracker(label: "playback") : nil
 
-let captureStatus = AudioDeviceCreateIOProcIDWithBlock(&captureProcID, attenuatorDeviceID, nil) { _, inInputData, _, _, _ in
-    let bufferList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
-    guard let buffer = bufferList.first, let data = buffer.mData else { return }
-    let frameCount = Int(buffer.mDataByteSize) / (Int(kChannels) * MemoryLayout<Float32>.size)
-    guard frameCount > 0 else { return }
-    data.withMemoryRebound(to: Float32.self, capacity: frameCount * Int(kChannels)) { floatPtr in
-        captureOnset?.check(floatPtr, count: frameCount * Int(kChannels))
-        _ = catt_ring_buffer_write(ringBuffer, floatPtr, frameCount)
-    }
-}
-guard captureStatus == noErr, let captureProcID else {
-    FileHandle.standardError.write("Failed to create capture IOProc (status \(captureStatus)).\n".data(using: .utf8)!)
-    exit(1)
-}
-
-let playbackStatus = AudioDeviceCreateIOProcIDWithBlock(&playbackProcID, outputDeviceID, nil) { _, _, _, outOutputData, _ in
-    let bufferList = UnsafeMutableAudioBufferListPointer(outOutputData)
-    guard let buffer = bufferList.first, let data = buffer.mData else { return }
-    let frameCount = Int(buffer.mDataByteSize) / (outChannels * MemoryLayout<Float32>.size)
-    guard frameCount > 0 else { return }
-
-    if outChannels == Int(kChannels) {
-        data.withMemoryRebound(to: Float32.self, capacity: frameCount * outChannels) { floatPtr in
-            _ = catt_ring_buffer_read(ringBuffer, floatPtr, frameCount)
-            playbackOnset?.check(floatPtr, count: frameCount * outChannels)
-        }
+    if tapManager.tapped.isEmpty {
+        print("No requested app could be tapped; everything will play through the fallback path.")
     } else {
-        // Real device has more than 2 channels: read stereo into a scratch
-        // buffer, then spread into channels 0/1 and zero the rest.
-        var scratch = [Float32](repeating: 0, count: frameCount * Int(kChannels))
-        _ = catt_ring_buffer_read(ringBuffer, &scratch, frameCount)
-        data.withMemoryRebound(to: Float32.self, capacity: frameCount * outChannels) { floatPtr in
-            for frame in 0..<frameCount {
-                for ch in 0..<outChannels {
-                    floatPtr[frame * outChannels + ch] = ch < Int(kChannels) ? scratch[frame * Int(kChannels) + ch] : 0
-                }
-            }
-            playbackOnset?.check(floatPtr, count: frameCount * outChannels)
+        print("Tapped \(tapManager.tapped.count) app(s):")
+        for app in tapManager.tapped {
+            print("  slot \(app.slot): \(app.selector) -> \(app.processObjectIDs.count) process(es), \(app.displayName)")
+        }
+        // The buffer-per-sub-tap layout is what the gain slots rely on, so
+        // verify it against the device rather than trusting the assumption.
+        if let bufferCount = tapManager.aggregateInputBufferCount(), bufferCount != tapManager.tapped.count {
+            FileHandle.standardError.write("Warning: aggregate reports \(bufferCount) input buffer(s) for \(tapManager.tapped.count) tap(s); per-app gains may be misapplied.\n".data(using: .utf8)!)
         }
     }
 }
-guard playbackStatus == noErr, let playbackProcID else {
-    FileHandle.standardError.write("Failed to create playback IOProc (status \(playbackStatus)).\n".data(using: .utf8)!)
+
+// MARK: - Start the relay
+
+let relay: AudioRelay
+do {
+    relay = try AudioRelay(
+        fallbackDeviceID: fallbackDeviceID,
+        outputDeviceID: outputDeviceID,
+        outputChannels: outChannels,
+        aggregateDeviceID: tapManager.aggregateDeviceID,
+        tapCount: tapManager.tapped.count
+    )
+} catch {
+    FileHandle.standardError.write("Relay setup failed: \(error)\n".data(using: .utf8)!)
+    tapManager.teardown()
     exit(1)
 }
 
-guard AudioDeviceStart(attenuatorDeviceID, captureProcID) == noErr else {
-    FileHandle.standardError.write("Failed to start capture on Attenuator Device.\n".data(using: .utf8)!)
-    exit(1)
+// Apply the requested gains. Tapped apps use their slot; anything not tapped
+// rides the fallback gain, so no app is ever left silent by default.
+for app in tapManager.tapped {
+    if let requested = requestedTaps.first(where: { $0.bundleID == app.selector }) {
+        relay.setGain(slot: app.slot, value: requested.gain)
+    }
 }
-guard AudioDeviceStart(outputDeviceID, playbackProcID) == noErr else {
-    FileHandle.standardError.write("Failed to start playback on real output device.\n".data(using: .utf8)!)
+relay.setFallbackGain(fallbackGain)
+relay.setMasterGain(masterGain)
+
+do {
+    try relay.start()
+} catch {
+    FileHandle.standardError.write("Failed to start audio: \(error)\n".data(using: .utf8)!)
+    tapManager.teardown()
     exit(1)
 }
 
-print("Running. Set Attenuator Device as your system output and play audio in any app.")
+print("")
+print("Running. Set Attenuator Device as your system output and play audio.")
+print("  fallback (untapped apps): \(Int(fallbackGain * 100))%   master: \(Int(masterGain * 100))%")
+for app in tapManager.tapped {
+    print("  \(app.selector): \(Int(relay.gain(slot: app.slot) * 100))%")
+}
 print(duration > 0 ? "Stopping automatically after \(duration)s." : "Press Ctrl+C to stop.")
 
-// MARK: - Graceful shutdown
+// MARK: - Run loop
 
 final class ShutdownFlag: @unchecked Sendable {
     var shouldStop = false
 }
 let shutdownFlag = ShutdownFlag()
 
-signal(SIGINT) { _ in
-    shutdownFlag.shouldStop = true
-}
+signal(SIGINT) { _ in shutdownFlag.shouldStop = true }
+signal(SIGTERM) { _ in shutdownFlag.shouldStop = true }
 
 let startTime = Date()
 var lastReport = Date.distantPast
 while !shutdownFlag.shouldStop {
-    if duration > 0 && Date().timeIntervalSince(startTime) >= duration {
-        break
-    }
+    if duration > 0 && Date().timeIntervalSince(startTime) >= duration { break }
     if diagEnabled && Date().timeIntervalSince(lastReport) >= 1.0 {
-        let backlogFrames = catt_ring_buffer_available_for_read(ringBuffer)
-        let backlogMs = Double(backlogFrames) / kSampleRate * 1000.0
-        print(String(format: "[diag] agent ring buffer backlog: %d frames (%.1f ms)", backlogFrames, backlogMs))
+        let b = relay.backlogs
+        let p = relay.takePeaks()
+        print(String(
+            format: "[diag] backlog fallback=%d (%.1f ms) taps=%d (%.1f ms) | peak tapmix=%.4f fallback=%.4f out=%.4f",
+            b.fallback, Double(b.fallback) / kSampleRate * 1000.0,
+            b.taps, Double(b.taps) / kSampleRate * 1000.0,
+            p.tapMix, p.fallback, p.output
+        ))
         lastReport = Date()
     }
     usleep(200_000)
 }
 
 print("\nStopping...")
-AudioDeviceStop(attenuatorDeviceID, captureProcID)
-AudioDeviceStop(outputDeviceID, playbackProcID)
-AudioDeviceDestroyIOProcID(attenuatorDeviceID, captureProcID)
-AudioDeviceDestroyIOProcID(outputDeviceID, playbackProcID)
+relay.stop()
+tapManager.teardown()
 print("Stopped.")

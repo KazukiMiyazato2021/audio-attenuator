@@ -3,7 +3,9 @@ import PackageDescription
 
 let package = Package(
     name: "AttenuatorAgent",
-    platforms: [.macOS(.v14)],
+    // 14.4 rather than .v14: the Core Audio process-tap API this agent
+    // is built around is only available from 14.2, and the project targets 14.4.
+    platforms: [.macOS("14.4")],
     targets: [
         .target(
             name: "CAudioShim",
@@ -13,6 +15,9 @@ let package = Package(
             name: "AttenuatorAgent",
             dependencies: ["CAudioShim"],
             path: "Sources/AttenuatorAgent",
+            // Info.plist is consumed by scripts/package-app.sh when it builds
+            // the .app bundle, not embedded by SwiftPM.
+            exclude: ["Resources/Info.plist"],
             linkerSettings: [
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("AudioToolbox"),
