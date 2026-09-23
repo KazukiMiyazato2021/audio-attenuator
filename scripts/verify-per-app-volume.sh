@@ -34,6 +34,30 @@ OUTPUT_DEVICE=BuiltInSpeakerDevice
 LABEL=com.audioattenuator.verify
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
+# The normal agent and this test job would both read the Attenuator Device and
+# fight over its audio, so the agent is stopped for the duration — and put back
+# on the way out, including on failure or Ctrl-C. Leaving it stopped silently
+# kills the user's audio with no obvious cause.
+AGENT_LABEL=com.audioattenuator.agent
+AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+AGENT_WAS_RUNNING=no
+if launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1; then
+    AGENT_WAS_RUNNING=yes
+fi
+
+wait_for_unload() {
+    for _ in $(seq 1 20); do
+        launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1 || return 0
+        sleep 0.5
+    done
+}
+
+if [ "$AGENT_WAS_RUNNING" = yes ]; then
+    echo "Stopping the running agent for the duration of the test..."
+    launchctl bootout "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null || true
+    wait_for_unload "$AGENT_LABEL"
+fi
+
 if [ ! -x "$BIN" ]; then
     echo "Error: $BIN not found. Run scripts/package-app.sh first."
     exit 1
@@ -48,8 +72,14 @@ cleanup() {
     rm -f "$PLIST"
     kill "$TONE_PID" 2>/dev/null || true
     wait "$TONE_PID" 2>/dev/null || true
+
+    if [ "$AGENT_WAS_RUNNING" = yes ]; then
+        wait_for_unload "$LABEL"
+        echo "Restarting the agent..."
+        launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" 2>/dev/null || true
+    fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 echo "Starting tone source (amplitude $TONE_AMPLITUDE)..."
 "$TONEPLAYER" com.audioattenuator.device.v001 200 &
@@ -86,17 +116,11 @@ PLISTEOF
     # bootout is asynchronous; bootstrapping again too soon fails with EIO,
     # so wait for the label to actually disappear before re-registering.
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-    for _ in $(seq 1 20); do
-        launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
-        sleep 0.5
-    done
+    wait_for_unload "$LABEL"
     launchctl bootstrap "gui/$(id -u)" "$PLIST"
     sleep 11
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-    for _ in $(seq 1 20); do
-        launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
-        sleep 0.5
-    done
+    wait_for_unload "$LABEL"
 
     local line
     line=$(grep "peak" "$log" | tail -1)
