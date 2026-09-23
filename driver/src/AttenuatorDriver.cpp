@@ -903,6 +903,36 @@ static OSStatus Attenuator_AbortDeviceConfigurationChange(AudioServerPlugInDrive
     return kAudioHardwareNoError;
 }
 
+#pragma mark - Change Notifications
+
+// Storing a new control value is not enough: without telling the host, no
+// client ever learns the volume moved, so listeners registered on the device's
+// volume never fire and anything downstream keeps using a stale value.
+//
+// Notifying is deferred to another queue because the host may call back into
+// the driver, and doing that from inside SetPropertyData can deadlock — the
+// same reason the box-acquired notification below is dispatched.
+static void NotifyVolumeChanged(void) {
+    if (!gPlugIn_Host) return;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        AudioObjectPropertyAddress addrs[] = {
+            { kAudioLevelControlPropertyScalarValue,  kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+            { kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        };
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Volume_Output, 2, addrs);
+    });
+}
+
+static void NotifyMuteChanged(void) {
+    if (!gPlugIn_Host) return;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        AudioObjectPropertyAddress addr = {
+            kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+        };
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Mute_Output, 1, &addr);
+    });
+}
+
 #pragma mark - Property Dispatch
 
 static Boolean Attenuator_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID objectID, pid_t clientPID, const AudioObjectPropertyAddress* addr) {
@@ -1009,6 +1039,7 @@ static OSStatus Attenuator_SetPropertyData(AudioServerPlugInDriverRef d, AudioOb
             if (val < 0.0f) val = 0.0f;
             if (val > 1.0f) val = 1.0f;
             gDevice.volumeOutput = val;
+            NotifyVolumeChanged();
             return kAudioHardwareNoError;
         }
         if (addr->mSelector == kAudioLevelControlPropertyDecibelValue) {
@@ -1018,12 +1049,14 @@ static OSStatus Attenuator_SetPropertyData(AudioServerPlugInDriverRef d, AudioOb
             if (scalar < 0.0f) scalar = 0.0f;
             if (scalar > 1.0f) scalar = 1.0f;
             gDevice.volumeOutput = scalar;
+            NotifyVolumeChanged();
             return kAudioHardwareNoError;
         }
     }
     // Mute control
     if (objectID == kObjectID_Mute_Output && addr->mSelector == kAudioBooleanControlPropertyValue) {
         gDevice.muteOutput = *((const UInt32*)inData) != 0;
+        NotifyMuteChanged();
         return kAudioHardwareNoError;
     }
     return kAudioHardwareNoError;

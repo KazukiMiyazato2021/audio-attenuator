@@ -28,12 +28,26 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/AttenuatorAgent"
 cp "$AGENT_DIR/Sources/AttenuatorAgent/Resources/Info.plist" "$APP/Contents/Info.plist"
 
-# Ad-hoc signature. TCC keys the grant to the code identity, so the grant is
-# invalidated whenever the binary changes and must be re-approved after a
-# rebuild. A Developer ID signature would make the grant stable; that is a
-# distribution concern, not needed for local development.
-echo "Signing (ad-hoc)..."
-codesign --force --sign - --timestamp=none "$APP"
+# TCC keys its grants to the code identity. An ad-hoc signature ("-") changes
+# on every build, so the microphone and audio-capture permissions have to be
+# re-approved after each rebuild. Signing with a stable certificate avoids
+# that: see scripts/create-signing-identity.sh.
+IDENTITY="${CODESIGN_IDENTITY:-}"
+if [ -z "$IDENTITY" ]; then
+    # Prefer a local dev identity if one exists, so permissions survive rebuilds.
+    if security find-identity -v -p codesigning 2>/dev/null | grep -q "Attenuator Dev"; then
+        IDENTITY="Attenuator Dev"
+    else
+        IDENTITY="-"
+    fi
+fi
+
+if [ "$IDENTITY" = "-" ]; then
+    echo "Signing (ad-hoc — permissions will need re-approving after each rebuild)..."
+else
+    echo "Signing with identity '$IDENTITY'..."
+fi
+codesign --force --sign "$IDENTITY" --timestamp=none "$APP"
 
 echo "Done: $APP"
 echo ""

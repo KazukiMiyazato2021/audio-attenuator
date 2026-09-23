@@ -47,6 +47,43 @@ final class MixerController: ObservableObject {
     private var refreshTimer: Timer?
     private var diagTimer: Timer?
 
+    /// The OS-level volume of the Attenuator Device — what the volume keys and
+    /// the Sound settings slider control while it is the system output. Our
+    /// driver records it but does not apply it to the samples it passes on, and
+    /// applying it there would miss everything arriving through process taps,
+    /// so it is folded into the final mix here instead.
+    private var systemVolume: Float = 1.0
+    private var systemMuted = false
+    private var volumeListener: AudioObjectPropertyListenerBlock?
+    private var muteListener: AudioObjectPropertyListenerBlock?
+    private var watchedDeviceID: AudioObjectID = kAudioObjectUnknown
+    /// Backstop for the listeners: a driver that forgets to notify on a
+    /// control change would otherwise leave the volume keys doing nothing,
+    /// with no visible error. Reading two properties a few times a second is
+    /// cheap next to that failure mode.
+    private var volumePollTimer: Timer?
+
+    /// Fires when devices appear or disappear, which is also how a coreaudiod
+    /// restart shows up. Every AudioObjectID and IOProc the relay holds is
+    /// invalidated by that restart, so the graph has to be rebuilt or the
+    /// agent goes silently dead — exactly what happens after reinstalling the
+    /// driver.
+    private var deviceListListener: AudioObjectPropertyListenerBlock?
+    private var rebuildAfterDeviceChangePending = false
+
+    /// The object IDs the relay's IOProcs were built against. CoreAudio hands
+    /// out fresh IDs after coreaudiod restarts, so an ID that no longer
+    /// matches the one the UID resolves to is a precise signal that the
+    /// relay is pointing at objects that no longer exist.
+    private var openedFallbackID: AudioObjectID = kAudioObjectUnknown
+    private var openedOutputID: AudioObjectID = kAudioObjectUnknown
+    /// Devices reappear a little after coreaudiod comes back, so the first
+    /// restart attempt can legitimately find nothing to play through. Without
+    /// a retry the agent would sit silent until the next unrelated device
+    /// change happened to wake it.
+    private var startRetries = 0
+    private static let maxStartRetries = 10
+
     /// Set while the tap set is being rebuilt, so overlapping slider moves
     /// coalesce into one rebuild instead of racing each other.
     private var rebuildPending = false
@@ -111,7 +148,65 @@ final class MixerController: ObservableObject {
         diagTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.logLevels() }
         }
+        watchDeviceList()
         log("controller start complete (isRunning=\(isRunning), status=\(status))")
+    }
+
+    private func watchDeviceList() {
+        guard deviceListListener == nil else { return }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            Task { @MainActor in self?.handleDeviceListChanged() }
+        }
+        if AudioObjectAddPropertyListenerBlock(kSystemObject, &address, DispatchQueue.main, block) == noErr {
+            deviceListListener = block
+        }
+    }
+
+    private func handleDeviceListChanged() {
+        // Device churn arrives in bursts (a coreaudiod restart republishes
+        // everything), so settle before rebuilding rather than thrashing.
+        guard !rebuildAfterDeviceChangePending else { return }
+        rebuildAfterDeviceChangePending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self else { return }
+            self.rebuildAfterDeviceChangePending = false
+            self.outputDevices = listOutputDevices()
+
+            // If our device vanished, or the relay is dead, start over. Object
+            // IDs from before a coreaudiod restart are meaningless now.
+            let deviceGone = findDeviceByUID(kAttenuatorDeviceUID) == nil
+            if deviceGone {
+                self.log("Attenuator Device disappeared; waiting for it to come back")
+                self.status = "Attenuator Device unavailable"
+                return
+            }
+            if !self.isRunning || self.audioObjectsAreStale() {
+                self.log("audio objects are stale or audio stopped; restarting")
+                self.restartAudio()
+            }
+        }
+    }
+
+    /// True when the IDs the relay was built on no longer refer to the devices
+    /// we meant. After a coreaudiod restart the IOProcs keep firing on schedule
+    /// with plausible-looking buffers, so waiting for the audio to stop flowing
+    /// does not catch this — the buffers are simply silent.
+    private func audioObjectsAreStale() -> Bool {
+        guard relay != nil else { return true }
+        guard let currentFallback = findDeviceByUID(kAttenuatorDeviceUID) else { return true }
+        if currentFallback != openedFallbackID { return true }
+
+        if let uid = selectedOutputUID,
+           let current = outputDevices.first(where: { $0.uid == uid })?.deviceID,
+           current != openedOutputID {
+            return true
+        }
+        return false
     }
 
     private func logLevels() {
@@ -126,10 +221,20 @@ final class MixerController: ObservableObject {
     }
 
     func stop() {
+        if let deviceListListener {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDevices,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(kSystemObject, &address, DispatchQueue.main, deviceListListener)
+            self.deviceListListener = nil
+        }
         refreshTimer?.invalidate()
         refreshTimer = nil
         diagTimer?.invalidate()
         diagTimer = nil
+        unwatchSystemVolume()
         relay?.stop()
         relay = nil
         tapManager.teardown()
@@ -140,13 +245,14 @@ final class MixerController: ObservableObject {
         guard let fallbackID = findDeviceByUID(kAttenuatorDeviceUID) else {
             status = "Attenuator Device not found — is the driver installed?"
             isRunning = false
-            log("Attenuator Device not found")
+            scheduleStartRetry(reason: "Attenuator Device not present")
             return
         }
 
         guard let outputID = resolveOutputDevice() else {
-            status = "No output device selected"
+            status = "Waiting for an output device…"
             isRunning = false
+            scheduleStartRetry(reason: "no output device yet")
             return
         }
 
@@ -175,7 +281,11 @@ final class MixerController: ObservableObject {
                 outputChannels: channels
             )
             try newRelay.start()
+            watchSystemVolume(on: fallbackID)
+            startRetries = 0
             relay = newRelay
+            openedFallbackID = fallbackID
+            openedOutputID = outputID
             isRunning = true
             status = "Routing to \(getDeviceName(outputID))"
             log("relay started -> \(getDeviceName(outputID)) (\(channels)ch)")
@@ -185,10 +295,76 @@ final class MixerController: ObservableObject {
             status = "Audio start failed: \(error)"
             isRunning = false
             log("relay start FAILED: \(error)")
+            scheduleStartRetry(reason: "relay start failed")
         }
     }
 
+    private func scheduleStartRetry(reason: String) {
+        guard startRetries < Self.maxStartRetries else {
+            log("giving up restarting audio after \(startRetries) attempts (\(reason))")
+            return
+        }
+        startRetries += 1
+        log("\(reason); retrying in 1s (attempt \(startRetries))")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, !self.isRunning else { return }
+            self.outputDevices = listOutputDevices()
+            self.startAudio()
+        }
+    }
+
+    /// Tracks the device's own volume/mute so OS volume changes take effect
+    /// immediately rather than only on the next restart.
+    private func watchSystemVolume(on deviceID: AudioObjectID) {
+        unwatchSystemVolume()
+        watchedDeviceID = deviceID
+        systemVolume = deviceVolumeScalar(deviceID) ?? 1.0
+        systemMuted = deviceMuted(deviceID) ?? false
+        log(String(format: "system volume %.3f muted=%@", systemVolume, systemMuted ? "yes" : "no"))
+
+        volumeListener = addDevicePropertyListener(deviceID, selector: kAudioDevicePropertyVolumeScalar) { [weak self] in
+            guard let self else { return }
+            self.systemVolume = deviceVolumeScalar(deviceID) ?? self.systemVolume
+            self.applyGains()
+        }
+        muteListener = addDevicePropertyListener(deviceID, selector: kAudioDevicePropertyMute) { [weak self] in
+            guard let self else { return }
+            self.systemMuted = deviceMuted(deviceID) ?? self.systemMuted
+            self.applyGains()
+        }
+
+        volumePollTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.pollSystemVolume() }
+        }
+    }
+
+    private func pollSystemVolume() {
+        guard watchedDeviceID != kAudioObjectUnknown else { return }
+        let volume = deviceVolumeScalar(watchedDeviceID) ?? systemVolume
+        let muted = deviceMuted(watchedDeviceID) ?? systemMuted
+        guard abs(volume - systemVolume) > 0.0001 || muted != systemMuted else { return }
+        systemVolume = volume
+        systemMuted = muted
+        applyGains()
+    }
+
+    private func unwatchSystemVolume() {
+        volumePollTimer?.invalidate()
+        volumePollTimer = nil
+        guard watchedDeviceID != kAudioObjectUnknown else { return }
+        if let volumeListener {
+            removeDevicePropertyListener(watchedDeviceID, selector: kAudioDevicePropertyVolumeScalar, block: volumeListener)
+        }
+        if let muteListener {
+            removeDevicePropertyListener(watchedDeviceID, selector: kAudioDevicePropertyMute, block: muteListener)
+        }
+        volumeListener = nil
+        muteListener = nil
+        watchedDeviceID = kAudioObjectUnknown
+    }
+
     private func restartAudio() {
+        unwatchSystemVolume()
         relay?.stop()
         relay = nil
         tapManager.teardown()
@@ -246,7 +422,15 @@ final class MixerController: ObservableObject {
 
     // MARK: - Volume changes
 
-    func setVolume(_ volume: Float, for bundleID: String) {
+    /// Applies a per-app volume.
+    ///
+    /// `live` is true for every intermediate value while a slider is being
+    /// dragged, so the volume follows the drag instead of jumping when the
+    /// mouse is released. The cheap part — writing the gain the audio thread
+    /// reads — happens on every call; the expensive part (rebuilding the tap
+    /// aggregate, re-enumerating processes) is debounced or deferred to the
+    /// end of the drag.
+    func setVolume(_ volume: Float, for bundleID: String, live: Bool = false) {
         let wasTapped = store.settings.perApp[bundleID] != nil
 
         store.update { settings in
@@ -268,7 +452,10 @@ final class MixerController: ObservableObject {
         } else {
             applyGains()
         }
-        refreshApps()
+
+        // Re-enumerating processes on every drag sample would be wasteful, and
+        // replacing the rows mid-drag can interrupt the gesture.
+        if !live { refreshApps() }
     }
 
     func volume(for bundleID: String) -> Float {
@@ -333,19 +520,29 @@ final class MixerController: ObservableObject {
             status = "Could not start per-app mixing: \(error)"
             tapManager.teardown()
         }
+        logGains()
     }
 
     /// Pushes every current volume into the atomic table the audio threads read.
     private func applyGains() {
         guard let relay else { return }
         let settings = store.settings
-        let master = settings.muteAll ? 0 : settings.masterGain
+        // The OS volume multiplies the app's own master so that both the
+        // volume keys and the in-app slider behave as users expect.
+        let muted = settings.muteAll || systemMuted
+        let master = muted ? 0 : settings.masterGain * systemVolume
 
         for app in tapManager.tapped {
             relay.setGain(slot: app.slot, value: settings.perApp[app.selector] ?? 1.0)
         }
         relay.setFallbackGain(settings.fallbackGain)
         relay.setMasterGain(master)
-        log("gains: master=\(master) fallback=\(settings.fallbackGain) perApp=\(settings.perApp) tapped=\(tapManager.tapped.map(\.selector))")
+    }
+
+    /// Logged on structural changes only — applyGains runs per drag sample and
+    /// would otherwise flood the log.
+    private func logGains() {
+        let settings = store.settings
+        log("gains: master=\(settings.muteAll ? 0 : settings.masterGain) fallback=\(settings.fallbackGain) perApp=\(settings.perApp) tapped=\(tapManager.tapped.map(\.selector))")
     }
 }

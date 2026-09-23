@@ -217,3 +217,71 @@ func autoSelectOutputDevice(from devices: [OutputDeviceInfo]) -> OutputDeviceInf
     }
     return physical.first
 }
+
+// MARK: - Device volume / mute
+
+/// The device's main output volume, 0.0-1.0, as the OS volume keys and the
+/// Sound settings slider set it.
+///
+/// Our driver stores this but does not apply it to the samples it passes
+/// through — CoreAudio leaves that to the driver, and applying it there would
+/// miss audio that reaches the mix through process taps instead of through the
+/// device. The agent applies it to the final mix so it affects everything.
+func deviceVolumeScalar(_ deviceID: AudioObjectID) -> Float? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyVolumeScalar,
+        mScope: kAudioObjectPropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var value: Float32 = 0
+    var size = UInt32(MemoryLayout<Float32>.size)
+    guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr else { return nil }
+    return value
+}
+
+func deviceMuted(_ deviceID: AudioObjectID) -> Bool? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyMute,
+        mScope: kAudioObjectPropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var value: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr else { return nil }
+    return value != 0
+}
+
+/// Watches a device property, calling `handler` on the main queue whenever it
+/// changes. Returns the block needed to unregister, or nil if registration
+/// failed.
+func addDevicePropertyListener(
+    _ deviceID: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeOutput,
+    handler: @escaping () -> Void
+) -> AudioObjectPropertyListenerBlock? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    let block: AudioObjectPropertyListenerBlock = { _, _ in handler() }
+    guard AudioObjectAddPropertyListenerBlock(deviceID, &address, DispatchQueue.main, block) == noErr else {
+        return nil
+    }
+    return block
+}
+
+func removeDevicePropertyListener(
+    _ deviceID: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeOutput,
+    block: @escaping AudioObjectPropertyListenerBlock
+) {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    AudioObjectRemovePropertyListenerBlock(deviceID, &address, DispatchQueue.main, block)
+}

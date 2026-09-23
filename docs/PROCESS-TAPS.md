@@ -122,8 +122,31 @@ while the tap path carries the audio. No double-playback, no gap.
 ## Ad-hoc signing invalidates grants on every rebuild
 
 TCC keys a grant to the code identity (cdhash). An ad-hoc signature changes on
-every build, so both permissions must be re-approved after each rebuild during
-development. A Developer ID signature would make the grants stable.
+every build, so both permissions must be re-approved after each rebuild.
+
+`scripts/create-signing-identity.sh` creates a local self-signed code-signing
+certificate so the identity stays stable and the permissions are granted once.
+`package-app.sh` picks it up automatically when present. Two macOS quirks make
+the script less obvious than it looks: the certificate needs
+`extendedKeyUsage=codeSigning` or codesign never offers it, and the PKCS#12
+bundle must be written with `-keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES
+-macalg sha1`, because Security framework rejects current OpenSSL defaults
+with a misleading "MAC verification failed (wrong password?)".
+
+## A coreaudiod restart silently kills the agent
+
+Reinstalling the driver restarts coreaudiod, which invalidates every
+AudioObjectID and IOProc the agent holds. The failure is quiet: the IOProcs
+keep firing on schedule with correctly-shaped buffers, and the ring backlog
+stays healthy — the buffers are just silent. Watching for audio to *stop
+flowing* therefore does not detect it.
+
+What does detect it: CoreAudio hands out fresh object IDs after the restart,
+so re-resolving the device UID and comparing against the ID the relay was
+built on is an exact signal. `MixerController` listens for
+`kAudioHardwarePropertyDevices` changes and rebuilds when the IDs no longer
+match. Devices reappear slightly after coreaudiod returns, so the first
+restart attempt can find no output device at all and the retry matters.
 
 ## Verified end to end
 

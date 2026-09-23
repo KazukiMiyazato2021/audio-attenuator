@@ -84,9 +84,11 @@ struct MenuBarView: View {
                 ScrollView {
                     VStack(spacing: 8) {
                         ForEach(controller.apps) { app in
-                            AppVolumeRow(app: app) { newValue in
-                                controller.setVolume(newValue, for: app.bundleID)
-                            }
+                            AppVolumeRow(
+                                app: app,
+                                onLiveChange: { controller.setVolume($0, for: app.bundleID, live: true) },
+                                onCommit: { controller.setVolume($0, for: app.bundleID) }
+                            )
                         }
                     }
                     .padding(.horizontal, 12)
@@ -144,9 +146,11 @@ private struct VolumeRow: View {
 
 private struct AppVolumeRow: View {
     let app: AppRow
-    let onChange: (Float) -> Void
+    let onLiveChange: (Float) -> Void
+    let onCommit: (Float) -> Void
 
     @State private var localValue: Float = 1.0
+    @State private var isDragging = false
 
     var body: some View {
         HStack(spacing: 8) {
@@ -165,8 +169,14 @@ private struct AppVolumeRow: View {
                             .help("Playing now")
                     }
                 }
+                // Apply while dragging so the volume follows the slider, and
+                // commit once on release for the expensive bookkeeping.
                 Slider(value: $localValue, in: 0...1.5) { editing in
-                    if !editing { onChange(localValue) }
+                    isDragging = editing
+                    if !editing { onCommit(localValue) }
+                }
+                .onChange(of: localValue) { _, newValue in
+                    if isDragging { onLiveChange(newValue) }
                 }
             }
 
@@ -179,6 +189,8 @@ private struct AppVolumeRow: View {
         // Keep in step with external changes (reset, another window) without
         // fighting the user mid-drag.
         .onChange(of: app.volume) { _, newValue in
+            // Never fight the user mid-drag.
+            guard !isDragging else { return }
             if abs(newValue - localValue) > 0.001 { localValue = newValue }
         }
     }
