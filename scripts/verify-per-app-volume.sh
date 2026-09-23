@@ -83,15 +83,27 @@ run_case() {
 </plist>
 PLISTEOF
 
+    # bootout is asynchronous; bootstrapping again too soon fails with EIO,
+    # so wait for the label to actually disappear before re-registering.
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+        sleep 0.5
+    done
     launchctl bootstrap "gui/$(id -u)" "$PLIST"
     sleep 11
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+        sleep 0.5
+    done
 
     local line
     line=$(grep "peak" "$log" | tail -1)
     if [ -z "$line" ]; then
         echo "  ${pct}%: NO METER OUTPUT — check $log"
+        echo "         (a rebuild invalidates the ad-hoc code identity, so macOS"
+        echo "          may be waiting for the AudioCapture permission again)"
         return
     fi
     echo "  ${pct}%: $(echo "$line" | sed 's/.*| //')"

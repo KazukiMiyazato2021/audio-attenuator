@@ -15,14 +15,21 @@ import Foundation
 /// at two regardless of how many apps are tapped, so adding or removing a tap
 /// never allocates a buffer on the audio thread.
 ///
+/// The tap section attaches and detaches independently of the fallback and
+/// output paths, so changing which apps are tapped — which requires rebuilding
+/// the aggregate device — never interrupts audio for everything else.
+///
 /// Everything inside the three IOProcs is allocation-, lock-, and syscall-free:
 /// gains come from an atomic table and audio moves through lock-free rings.
 final class AudioRelay {
+    /// Gain slots are allocated once for this many taps so that adding or
+    /// removing an app at runtime never resizes the table the audio threads
+    /// read from. Far more than anyone will assign individual volumes to.
+    static let maxTaps = 64
+
     private let fallbackDeviceID: AudioObjectID
     private let outputDeviceID: AudioObjectID
     private let outputChannels: Int
-    private let aggregateDeviceID: AudioObjectID
-    private let tapCount: Int
 
     private let fallbackRing: OpaquePointer
     private let tapMixRing: OpaquePointer
@@ -48,38 +55,40 @@ final class AudioRelay {
 
     private var fallbackProcID: AudioDeviceIOProcID?
     private var outputProcID: AudioDeviceIOProcID?
-    private var aggregateProcID: AudioDeviceIOProcID?
 
-    /// Slot `tapCount` holds the fallback gain, slot `tapCount + 1` the master.
-    private var fallbackGainSlot: Int { tapCount }
-    private var masterGainSlot: Int { tapCount + 1 }
+    private var aggregateProcID: AudioDeviceIOProcID?
+    private var attachedAggregateID: AudioObjectID = kAudioObjectUnknown
+
+    /// Read by the output IOProc to decide whether to pull the tap ring.
+    /// Stored in the atomic meter table so the audio thread never reads a
+    /// value the control thread is mid-write on.
+    private let tapActiveSlot = 3
+
+    private var fallbackGainSlot: Int { Self.maxTaps }
+    private var masterGainSlot: Int { Self.maxTaps + 1 }
 
     init(
         fallbackDeviceID: AudioObjectID,
         outputDeviceID: AudioObjectID,
         outputChannels: Int,
-        aggregateDeviceID: AudioObjectID,
-        tapCount: Int,
         maxFramesPerCallback: Int = 8192
     ) throws {
         self.fallbackDeviceID = fallbackDeviceID
         self.outputDeviceID = outputDeviceID
         self.outputChannels = outputChannels
-        self.aggregateDeviceID = aggregateDeviceID
-        self.tapCount = tapCount
         self.scratchFrames = maxFramesPerCallback
 
         guard let fallbackRing = catt_ring_buffer_create(kRingBufferFrames, Int(kChannels)),
               let tapMixRing = catt_ring_buffer_create(kRingBufferFrames, Int(kChannels)),
-              let gains = catt_gain_store_create(tapCount + 2),
-              let meters = catt_gain_store_create(3) else {
+              let gains = catt_gain_store_create(Self.maxTaps + 2),
+              let meters = catt_gain_store_create(4) else {
             throw RelayError.allocationFailed
         }
         self.fallbackRing = fallbackRing
         self.tapMixRing = tapMixRing
         self.gains = gains
         self.meters = meters
-        for slot in 0..<3 { catt_gain_store_set(meters, slot, 0) }
+        for slot in 0..<4 { catt_gain_store_set(meters, slot, 0) }
 
         let scratchSamples = maxFramesPerCallback * Int(kChannels)
         tapScratch = .allocate(capacity: scratchSamples)
@@ -119,6 +128,9 @@ final class AudioRelay {
         catt_gain_store_get(gains, slot)
     }
 
+    var fallbackGain: Float { catt_gain_store_get(gains, fallbackGainSlot) }
+    var masterGain: Float { catt_gain_store_get(gains, masterGainSlot) }
+
     /// Current ring backlogs in frames, for diagnostics.
     var backlogs: (fallback: Int, taps: Int) {
         (catt_ring_buffer_available_for_read(fallbackRing),
@@ -139,11 +151,12 @@ final class AudioRelay {
 
     // MARK: - Lifecycle
 
+    /// Starts the fallback capture and the output. These stay running for the
+    /// lifetime of the relay; the tap section comes and goes around them.
     func start() throws {
         let ring = fallbackRing
         let scratchCap = scratchFrames * Int(kChannels)
 
-        // --- Fallback capture: everything not individually tapped ---
         var fallbackID: AudioDeviceIOProcID?
         let fallbackStatus = AudioDeviceCreateIOProcIDWithBlock(&fallbackID, fallbackDeviceID, nil) { _, inInputData, _, _, _ in
             let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
@@ -159,66 +172,6 @@ final class AudioRelay {
         }
         fallbackProcID = fallbackID
 
-        // --- Tap aggregate capture: per-app buffers, gain-applied and summed ---
-        if aggregateDeviceID != kAudioObjectUnknown && tapCount > 0 {
-            let tapRing = tapMixRing
-            let gainStore = gains
-            let meterStore = meters
-            let scratch = tapScratch
-            let expectedTaps = tapCount
-
-            var aggID: AudioDeviceIOProcID?
-            let aggStatus = AudioDeviceCreateIOProcIDWithBlock(&aggID, aggregateDeviceID, nil) { _, inInputData, _, _, _ in
-                let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
-                guard let first = list.first else { return }
-                let frames = Int(first.mDataByteSize) / (Int(first.mNumberChannels) * MemoryLayout<Float32>.size)
-                guard frames > 0, frames * Int(kChannels) <= scratchCap else { return }
-
-                let sampleCount = frames * Int(kChannels)
-                scratch.update(repeating: 0, count: sampleCount)
-
-                // One buffer per sub-tap, in sub-tap-list order — so buffer
-                // index is the app's gain slot.
-                for (slot, buffer) in list.enumerated() {
-                    guard slot < expectedTaps, let data = buffer.mData else { continue }
-                    let gain = catt_gain_store_get(gainStore, slot)
-                    if gain == 0 { continue }
-                    let channels = Int(buffer.mNumberChannels)
-                    data.withMemoryRebound(to: Float32.self, capacity: frames * channels) { ptr in
-                        if channels == Int(kChannels) {
-                            for i in 0..<sampleCount { scratch[i] += ptr[i] * gain }
-                        } else if channels == 1 {
-                            // Mono tap: duplicate into both output channels.
-                            for f in 0..<frames {
-                                let v = ptr[f] * gain
-                                scratch[f * 2] += v
-                                scratch[f * 2 + 1] += v
-                            }
-                        } else {
-                            // Wider than stereo: take the first two channels.
-                            for f in 0..<frames {
-                                scratch[f * 2] += ptr[f * channels] * gain
-                                scratch[f * 2 + 1] += ptr[f * channels + 1] * gain
-                            }
-                        }
-                    }
-                }
-
-                var peak: Float32 = 0
-                for i in 0..<sampleCount { peak = max(peak, abs(scratch[i])) }
-                if peak > catt_gain_store_get(meterStore, Self.meterTapMix) {
-                    catt_gain_store_set(meterStore, Self.meterTapMix, peak)
-                }
-
-                _ = catt_ring_buffer_write(tapRing, scratch, frames)
-            }
-            guard aggStatus == noErr, let aggID else {
-                throw RelayError.ioProcCreationFailed("tap aggregate", aggStatus)
-            }
-            aggregateProcID = aggID
-        }
-
-        // --- Output: sum both paths, apply master, clamp, write to hardware ---
         let tapRing = tapMixRing
         let gainStore = gains
         let meterStore = meters
@@ -227,7 +180,7 @@ final class AudioRelay {
         let outChannels = outputChannels
         let fbSlot = fallbackGainSlot
         let mSlot = masterGainSlot
-        let hasTaps = tapCount > 0
+        let activeSlot = tapActiveSlot
 
         var outID: AudioDeviceIOProcID?
         let outStatus = AudioDeviceCreateIOProcIDWithBlock(&outID, outputDeviceID, nil) { _, _, _, outOutputData, _ in
@@ -238,7 +191,7 @@ final class AudioRelay {
 
             let sampleCount = frames * Int(kChannels)
             _ = catt_ring_buffer_read(ring, fbScratch, frames)
-            if hasTaps {
+            if catt_gain_store_get(meterStore, activeSlot) > 0.5 {
                 _ = catt_ring_buffer_read(tapRing, mix, frames)
             } else {
                 mix.update(repeating: 0, count: sampleCount)
@@ -284,30 +237,107 @@ final class AudioRelay {
         }
         outputProcID = outID
 
-        // Start capture paths before the output, so the output never runs dry
-        // waiting for its first frames.
+        // Start capture before output so the output never runs dry waiting for
+        // its first frames.
         let fbStart = AudioDeviceStart(fallbackDeviceID, fallbackID)
         guard fbStart == noErr else { throw RelayError.startFailed("fallback capture", fbStart) }
-
-        if let aggregateProcID {
-            let aggStart = AudioDeviceStart(aggregateDeviceID, aggregateProcID)
-            guard aggStart == noErr else { throw RelayError.startFailed("tap aggregate", aggStart) }
-        }
 
         let outStart = AudioDeviceStart(outputDeviceID, outID)
         guard outStart == noErr else { throw RelayError.startFailed("output", outStart) }
     }
 
+    /// Attaches a tap aggregate. Replaces any previously attached one.
+    ///
+    /// `tapCount` is the number of sub-taps, and a sub-tap's index is its gain
+    /// slot — the aggregate delivers one AudioBuffer per sub-tap in
+    /// sub-tap-list order.
+    func attachTapAggregate(deviceID: AudioObjectID, tapCount: Int) throws {
+        detachTapAggregate()
+        guard deviceID != kAudioObjectUnknown, tapCount > 0 else { return }
+
+        let tapRing = tapMixRing
+        let gainStore = gains
+        let meterStore = meters
+        let scratch = tapScratch
+        let scratchCap = scratchFrames * Int(kChannels)
+        let expectedTaps = min(tapCount, Self.maxTaps)
+
+        var aggID: AudioDeviceIOProcID?
+        let status = AudioDeviceCreateIOProcIDWithBlock(&aggID, deviceID, nil) { _, inInputData, _, _, _ in
+            let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
+            guard let first = list.first else { return }
+            let frames = Int(first.mDataByteSize) / (Int(first.mNumberChannels) * MemoryLayout<Float32>.size)
+            guard frames > 0, frames * Int(kChannels) <= scratchCap else { return }
+
+            let sampleCount = frames * Int(kChannels)
+            scratch.update(repeating: 0, count: sampleCount)
+
+            for (slot, buffer) in list.enumerated() {
+                guard slot < expectedTaps, let data = buffer.mData else { continue }
+                let gain = catt_gain_store_get(gainStore, slot)
+                if gain == 0 { continue }
+                let channels = Int(buffer.mNumberChannels)
+                data.withMemoryRebound(to: Float32.self, capacity: frames * channels) { ptr in
+                    if channels == Int(kChannels) {
+                        for i in 0..<sampleCount { scratch[i] += ptr[i] * gain }
+                    } else if channels == 1 {
+                        for f in 0..<frames {
+                            let v = ptr[f] * gain
+                            scratch[f * 2] += v
+                            scratch[f * 2 + 1] += v
+                        }
+                    } else {
+                        for f in 0..<frames {
+                            scratch[f * 2] += ptr[f * channels] * gain
+                            scratch[f * 2 + 1] += ptr[f * channels + 1] * gain
+                        }
+                    }
+                }
+            }
+
+            var peak: Float32 = 0
+            for i in 0..<sampleCount { peak = max(peak, abs(scratch[i])) }
+            if peak > catt_gain_store_get(meterStore, Self.meterTapMix) {
+                catt_gain_store_set(meterStore, Self.meterTapMix, peak)
+            }
+
+            _ = catt_ring_buffer_write(tapRing, scratch, frames)
+        }
+        guard status == noErr, let aggID else {
+            throw RelayError.ioProcCreationFailed("tap aggregate", status)
+        }
+
+        let startStatus = AudioDeviceStart(deviceID, aggID)
+        guard startStatus == noErr else {
+            AudioDeviceDestroyIOProcID(deviceID, aggID)
+            throw RelayError.startFailed("tap aggregate", startStatus)
+        }
+
+        aggregateProcID = aggID
+        attachedAggregateID = deviceID
+        catt_gain_store_set(meters, tapActiveSlot, 1)
+    }
+
+    func detachTapAggregate() {
+        // Tell the output IOProc to stop pulling the tap ring before the
+        // producer goes away, so it fills with silence instead of replaying
+        // whatever was left in the ring.
+        catt_gain_store_set(meters, tapActiveSlot, 0)
+        if let aggregateProcID, attachedAggregateID != kAudioObjectUnknown {
+            AudioDeviceStop(attachedAggregateID, aggregateProcID)
+            AudioDeviceDestroyIOProcID(attachedAggregateID, aggregateProcID)
+        }
+        aggregateProcID = nil
+        attachedAggregateID = kAudioObjectUnknown
+        catt_ring_buffer_clear(tapMixRing)
+    }
+
     func stop() {
+        detachTapAggregate()
         if let outputProcID {
             AudioDeviceStop(outputDeviceID, outputProcID)
             AudioDeviceDestroyIOProcID(outputDeviceID, outputProcID)
             self.outputProcID = nil
-        }
-        if let aggregateProcID {
-            AudioDeviceStop(aggregateDeviceID, aggregateProcID)
-            AudioDeviceDestroyIOProcID(aggregateDeviceID, aggregateProcID)
-            self.aggregateProcID = nil
         }
         if let fallbackProcID {
             AudioDeviceStop(fallbackDeviceID, fallbackProcID)

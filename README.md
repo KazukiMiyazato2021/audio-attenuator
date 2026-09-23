@@ -56,15 +56,24 @@ sudo scripts/uninstall.sh
 scripts/package-app.sh
 ```
 
-2. システム設定 → プライバシーとセキュリティ → 画面収録とシステムオーディオ録音 で
-   「Attenuator」を有効にする
+   CLIバイナリのままでは権限を付与できない(バンドル識別がないため)。
+
+2. **2つの権限**を許可する(どちらも欠けるとエラーではなく**無音**になる):
+   - システム設定 → プライバシーとセキュリティ → **マイク** → 「Attenuator」をオン
+     (仮想デバイスでも入力ストリームの読み取りはマイク権限を要求する)
+   - システム設定 → プライバシーとセキュリティ → **画面収録とシステムオーディオ録音** → 「Attenuator」をオン
+     (アプリ単位のタップに必要)
+
+   権限は**付与後に起動したプロセス**にのみ適用されるため、許可したらエージェントを再起動する。
+   また開発中はビルドのたびにad-hoc署名のコード識別が変わり、再許可が必要になる。
 
 3. launchd経由で起動する(ターミナルからの直接起動では権限が適用されない):
 
 ```bash
-cp launchd/com.audioattenuator.agent.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.audioattenuator.agent.plist
+scripts/install-agent.sh          # sudoは不要
 ```
+
+アンインストールは `scripts/uninstall-agent.sh`。
 
 ### CLIオプション
 

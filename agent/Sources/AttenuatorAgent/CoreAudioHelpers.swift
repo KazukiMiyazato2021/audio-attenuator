@@ -88,11 +88,25 @@ func allDeviceIDs() -> [AudioObjectID] {
     return ids
 }
 
-struct OutputDeviceInfo {
+struct OutputDeviceInfo: Equatable {
     let deviceID: AudioObjectID
     let name: String
     let uid: String
-    let isVirtual: Bool
+    let transportType: UInt32
+
+    var isVirtual: Bool { transportType == kAudioDeviceTransportTypeVirtual }
+
+    /// Aggregate and multi-output devices are real enough to appear in the
+    /// device list but are usually built *on top of* other devices — including,
+    /// potentially, our own virtual device. Auto-selecting one can route the
+    /// mix back into the loop or into a device that plays nothing, so they are
+    /// offered but never chosen automatically.
+    var isAggregate: Bool {
+        transportType == kAudioDeviceTransportTypeAggregate
+    }
+
+    /// True for actual hardware the user can hear.
+    var isPhysical: Bool { !isVirtual && !isAggregate }
 }
 
 func listOutputDevices() -> [OutputDeviceInfo] {
@@ -103,7 +117,7 @@ func listOutputDevices() -> [OutputDeviceInfo] {
                 deviceID: id,
                 name: getDeviceName(id),
                 uid: getDeviceUID(id),
-                isVirtual: getTransportType(id) == kAudioDeviceTransportTypeVirtual
+                transportType: getTransportType(id)
             )
         }
 }
@@ -174,3 +188,32 @@ func trySetNominalSampleRate(_ deviceID: AudioObjectID, rate: Float64) {
     }
 }
 
+
+
+/// The device macOS is currently using as the system default output.
+func defaultOutputDeviceID() -> AudioObjectID? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var deviceID: AudioObjectID = kAudioObjectUnknown
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(kSystemObject, &address, 0, nil, &size, &deviceID) == noErr,
+          deviceID != kAudioObjectUnknown else { return nil }
+    return deviceID
+}
+
+/// Picks where the final mix should play when the user has not chosen.
+///
+/// Prefers built-in hardware, then any other physical device. Aggregate and
+/// multi-output devices are skipped: they are frequently built on top of the
+/// Attenuator Device itself, so routing the mix into one can feed our own
+/// output back into our own input.
+func autoSelectOutputDevice(from devices: [OutputDeviceInfo]) -> OutputDeviceInfo? {
+    let physical = devices.filter(\.isPhysical)
+    if let builtIn = physical.first(where: { $0.transportType == kAudioDeviceTransportTypeBuiltIn }) {
+        return builtIn
+    }
+    return physical.first
+}

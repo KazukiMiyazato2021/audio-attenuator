@@ -33,6 +33,16 @@
     <key>LSUIElement</key>
     <true/>
 
+    <!-- Required to read the Attenuator Device's input stream. Reading *any*
+         audio device's input is microphone-class access as far as TCC is
+         concerned, even when the device is virtual and carries no microphone.
+         Without this key macOS refuses to even prompt, and the input stream
+         delivers silence with no error:
+           "Refusing authorization request for service kTCCServiceMicrophone
+            ... without NSMicrophoneUsageDescription key" -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Attenuator reads the Attenuator Device's audio so it can mix it and play it through your speakers.</string>
+
     <!-- Required for Core Audio process taps. Without a bundle identity and
          this usage string, macOS does not attribute the AudioCapture TCC
          request to this app: taps still get created successfully but deliver

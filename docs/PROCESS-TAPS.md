@@ -22,6 +22,37 @@ This is what lets a per-app gain be applied by buffer index. `TapManager`
 still reads the count back from the device and warns on a mismatch rather
 than trusting the assumption.
 
+## Two separate permissions are needed, and both fail silently
+
+Reading the Attenuator Device's **input stream** is microphone-class access as
+far as TCC is concerned, even though the device is virtual and has no
+microphone. That is a *different* permission from the one the taps need:
+
+| What | TCC service | Info.plist key | System Settings pane |
+|---|---|---|---|
+| Reading the virtual device's input | `kTCCServiceMicrophone` | `NSMicrophoneUsageDescription` | Microphone |
+| Per-app process taps | `kTCCServiceAudioCapture` | `NSAudioCaptureUsageDescription` | Screen & System Audio Recording |
+
+Missing the microphone key produces exactly the same silent failure as the
+audio-capture one:
+
+```
+Refusing authorization request for service kTCCServiceMicrophone and subject
+Sub:{com.audioattenuator.agent} ... without NSMicrophoneUsageDescription key
+```
+
+Terminals usually already hold the microphone permission, which is why a CLI
+build can appear to work perfectly while the packaged agent gets nothing but
+zeros — the terminal's grant was doing the work.
+
+**A grant only takes effect for a process started after it.** An agent that
+was already running when permission was granted keeps failing (observed as
+`AudioDeviceStart` returning 268451843) until it is restarted.
+
+Because opening a device blocks until the prompt is answered, the audio setup
+must not run inline in `applicationDidFinishLaunching` — doing so leaves the
+menu bar icon missing and the app looking hung while the prompt waits.
+
 ## The silent failure: TCC attribution
 
 **A tap can be created successfully and still deliver nothing but zeros.**
@@ -87,6 +118,12 @@ With `muteBehavior = .muted`, a tapped app's audio stops reaching its normal
 output route the instant the tap exists. Measured with a 0.3-amplitude tone:
 the fallback path (reading the Attenuator Device) drops to exactly 0.0000
 while the tap path carries the audio. No double-playback, no gap.
+
+## Ad-hoc signing invalidates grants on every rebuild
+
+TCC keys a grant to the code identity (cdhash). An ad-hoc signature changes on
+every build, so both permissions must be re-approved after each rebuild during
+development. A Developer ID signature would make the grants stable.
 
 ## Verified end to end
 

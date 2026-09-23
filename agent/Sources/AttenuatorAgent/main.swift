@@ -56,12 +56,27 @@ var masterGain: Float = 1.0
 var requestedTaps: [(bundleID: String, gain: Float)] = []
 
 var args = Array(CommandLine.arguments.dropFirst())
+
+// No arguments means the normal product launch (that is how the LaunchAgent
+// starts it), so show the menu bar UI. The flags below stay available for the
+// headless verification scripts.
+if args.isEmpty {
+    // Top-level code already runs on the main thread; assumeIsolated states
+    // that to the compiler without hopping off it (runMenuBarApp never returns).
+    MainActor.assumeIsolated { runMenuBarApp() }
+}
+
 var i = 0
 while i < args.count {
     switch args[i] {
     case "--list-devices":
+        let auto = autoSelectOutputDevice(from: listOutputDevices())
         for d in listOutputDevices() {
-            let tag = d.isVirtual ? " [virtual]" : ""
+            var tags: [String] = []
+            if d.isVirtual { tags.append("virtual") }
+            if d.isAggregate { tags.append("aggregate") }
+            if d.uid == auto?.uid { tags.append("auto-selected") }
+            let tag = tags.isEmpty ? "" : " [\(tags.joined(separator: ", "))]"
             print("\(d.name)\t\(d.uid)\(tag)")
         }
         exit(0)
@@ -131,16 +146,13 @@ if let outputArg {
         FileHandle.standardError.write("No output device matching '\(outputArg)'. Use --list-devices to see options.\n".data(using: .utf8)!)
         exit(1)
     }
+} else if let auto = autoSelectOutputDevice(from: outputDevices) {
+    resolvedOutput = auto.deviceID
+    print("Auto-selected output device: \(auto.name)")
 } else {
-    let nonVirtual = outputDevices.filter { !$0.isVirtual }
-    if nonVirtual.count == 1 {
-        resolvedOutput = nonVirtual[0].deviceID
-        print("Defaulting to the only non-virtual output device: \(nonVirtual[0].name)")
-    } else {
-        FileHandle.standardError.write("Multiple (or zero) non-virtual output devices found; pass --output explicitly.\n".data(using: .utf8)!)
-        for d in nonVirtual { FileHandle.standardError.write("  \(d.name)\t\(d.uid)\n".data(using: .utf8)!) }
-        exit(1)
-    }
+    FileHandle.standardError.write("No physical output device found; pass --output explicitly.\n".data(using: .utf8)!)
+    for d in outputDevices { FileHandle.standardError.write("  \(d.name)\t\(d.uid)\n".data(using: .utf8)!) }
+    exit(1)
 }
 
 guard let outputDeviceID = resolvedOutput else { exit(1) }
@@ -196,9 +208,7 @@ do {
     relay = try AudioRelay(
         fallbackDeviceID: fallbackDeviceID,
         outputDeviceID: outputDeviceID,
-        outputChannels: outChannels,
-        aggregateDeviceID: tapManager.aggregateDeviceID,
-        tapCount: tapManager.tapped.count
+        outputChannels: outChannels
     )
 } catch {
     FileHandle.standardError.write("Relay setup failed: \(error)\n".data(using: .utf8)!)
@@ -218,6 +228,12 @@ relay.setMasterGain(masterGain)
 
 do {
     try relay.start()
+    if !tapManager.tapped.isEmpty {
+        try relay.attachTapAggregate(
+            deviceID: tapManager.aggregateDeviceID,
+            tapCount: tapManager.tapped.count
+        )
+    }
 } catch {
     FileHandle.standardError.write("Failed to start audio: \(error)\n".data(using: .utf8)!)
     tapManager.teardown()
