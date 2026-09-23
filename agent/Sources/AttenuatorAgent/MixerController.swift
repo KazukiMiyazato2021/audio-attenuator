@@ -392,12 +392,16 @@ final class MixerController: ObservableObject {
         // Collapse the several audio processes an app can have (browser helper
         // and GPU processes share the parent's bundle ID) into one row, so the
         // user sees "Chrome" rather than four indistinguishable entries.
+        // Grouped by owning application rather than by the process's own
+        // bundle ID: browser helpers all share one helper bundle ID, so
+        // grouping on that would merge unrelated web apps into a single row
+        // and make one slider move several apps at once.
         var grouped: [String: (name: String, pids: [pid_t], playing: Bool)] = [:]
         for proc in ProcessRegistry.outputCapable() {
-            var entry = grouped[proc.bundleID] ?? (proc.displayName, [], false)
+            var entry = grouped[proc.appKey] ?? (proc.displayName, [], false)
             entry.pids.append(proc.pid)
             entry.playing = entry.playing || proc.isRunningOutput
-            grouped[proc.bundleID] = entry
+            grouped[proc.appKey] = entry
         }
 
         let tappedIDs = Set(tapManager.tapped.map(\.selector))

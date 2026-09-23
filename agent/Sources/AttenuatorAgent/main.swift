@@ -81,9 +81,14 @@ while i < args.count {
         }
         exit(0)
     case "--list-apps":
+        // Grouped the same way the UI groups them, so --tap takes the key
+        // shown here.
+        var seen = Set<String>()
         for p in ProcessRegistry.outputCapable() {
-            let mark = p.isRunningOutput ? "  <-- playing now" : ""
-            print("\(p.bundleID)\tpid=\(p.pid)\t\(p.displayName)\(mark)")
+            guard seen.insert(p.appKey).inserted else { continue }
+            let members = ProcessRegistry.resolve(selector: p.appKey)
+            let mark = members.contains(where: \.isRunningOutput) ? "  <-- playing now" : ""
+            print("\(p.appKey)\t\(members.count) proc(s)\t\(p.displayName)\(mark)")
         }
         exit(0)
     case "--tap":

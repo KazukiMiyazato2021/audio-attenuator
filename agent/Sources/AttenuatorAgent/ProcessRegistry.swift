@@ -1,3 +1,4 @@
+import AppKit
 import CoreAudio
 import AudioToolbox
 import Foundation
@@ -10,21 +11,61 @@ import Foundation
 struct AudioProcessInfo {
     let objectID: AudioObjectID
     let pid: pid_t
+    /// The bundle ID CoreAudio reports for the process itself. For browser
+    /// helpers this is the shared helper ID, which is the same for every tab,
+    /// so it is not a usable identity to group or persist volumes by.
     let bundleID: String
     let isRunningOutput: Bool
 
-    /// Human-readable name, falling back through the running-app list and then
-    /// the bundle ID itself, since CoreAudio exposes no display name here.
+    /// The application a user would say this audio belongs to, found by walking
+    /// up the process tree to the nearest pid macOS treats as an application.
+    ///
+    /// This is what separates, say, a Chrome web app from ordinary Chrome tabs:
+    /// both run as `com.google.Chrome.helper` processes, but the web app
+    /// registers itself as its own application while a tab's helper resolves
+    /// up to the browser.
+    let ownerBundleID: String
+    let ownerName: String
+
+    /// Stable key to group rows by and to persist a volume against.
+    var appKey: String { ownerBundleID.isEmpty ? bundleID : ownerBundleID }
+
     var displayName: String {
-        if let app = NSRunningApplicationName(pid: pid), !app.isEmpty { return app }
+        if !ownerName.isEmpty { return ownerName }
+        if let exe = executableName(pid: pid), !exe.isEmpty { return exe }
         if !bundleID.isEmpty { return bundleID }
         return "pid \(pid)"
     }
 }
 
-private func NSRunningApplicationName(pid: pid_t) -> String? {
-    // Deliberately avoids importing AppKit so this stays usable from the
-    // headless CLI; the UI phase can swap in a richer lookup.
+/// The pid's parent, or nil at the top of the tree.
+private func parentPID(_ pid: pid_t) -> pid_t? {
+    var info = kinfo_proc()
+    var size = MemoryLayout<kinfo_proc>.size
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+    guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+    let ppid = info.kp_eproc.e_ppid
+    return ppid > 0 ? ppid : nil
+}
+
+/// Nearest ancestor (including the process itself) that macOS reports as a
+/// running application, which is the level users recognise and the level at
+/// which a volume makes sense.
+private func owningApplication(of pid: pid_t) -> (name: String, bundleID: String)? {
+    var current: pid_t? = pid
+    var hops = 0
+    while let p = current, hops < 6 {
+        if let app = NSRunningApplication(processIdentifier: p), let name = app.localizedName {
+            return (name, app.bundleIdentifier ?? "")
+        }
+        current = parentPID(p)
+        hops += 1
+    }
+    return nil
+}
+
+/// Last-resort name for daemons and helpers that are not applications.
+private func executableName(pid: pid_t) -> String? {
     var name: String? = nil
     var size: Int = 0
     var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
@@ -48,19 +89,33 @@ enum ProcessRegistry {
     /// All process objects CoreAudio currently knows about.
     static func all() -> [AudioProcessInfo] {
         processObjectIDs().map { objectID in
-            AudioProcessInfo(
+            let pid: pid_t = property(objectID, kAudioProcessPropertyPID, default: pid_t(-1))
+            let owner = owningApplication(of: pid)
+            return AudioProcessInfo(
                 objectID: objectID,
-                pid: property(objectID, kAudioProcessPropertyPID, default: pid_t(-1)),
+                pid: pid,
                 bundleID: bundleID(objectID),
-                isRunningOutput: property(objectID, kAudioProcessPropertyIsRunningOutput, default: UInt32(0)) != 0
+                isRunningOutput: property(objectID, kAudioProcessPropertyIsRunningOutput, default: UInt32(0)) != 0,
+                ownerBundleID: owner?.bundleID ?? "",
+                ownerName: owner?.name ?? ""
             )
         }
     }
 
     /// Processes worth showing to a user: they have an identity and are (or
     /// could be) producing output.
+    /// Excluded by bundle ID rather than pid: a second copy of the agent (the
+    /// CLI alongside the running menu bar agent, say) is still us.
+    private static let ownBundleID = Bundle.main.bundleIdentifier ?? "com.audioattenuator.agent"
+
     static func outputCapable() -> [AudioProcessInfo] {
-        all().filter { !$0.bundleID.isEmpty }
+        all().filter { proc in
+            guard !proc.appKey.isEmpty else { return false }
+            // The agent shows up because it writes the mix to the output
+            // device. Offering it as something to tap would route our own
+            // output back into our own input.
+            return proc.appKey != ownBundleID && proc.bundleID != ownBundleID
+        }
     }
 
     /// Resolves a user-supplied selector to *every* matching process.
@@ -79,6 +134,11 @@ enum ProcessRegistry {
         if selector.hasPrefix("pid:"), let pid = pid_t(selector.dropFirst(4)) {
             return processes.filter { $0.pid == pid }
         }
+
+        // Match the grouping key first, so tapping a row picks up every
+        // process that row represents.
+        let byAppKey = processes.filter { $0.appKey == selector }
+        if !byAppKey.isEmpty { return byAppKey }
 
         let byBundle = processes.filter { $0.bundleID == selector }
         if !byBundle.isEmpty { return byBundle }
