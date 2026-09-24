@@ -46,6 +46,7 @@ final class MixerController: ObservableObject {
     private var relay: AudioRelay?
     private var refreshTimer: Timer?
     private var diagTimer: Timer?
+    private var lastLevelReport = Date()
 
     /// The OS-level volume of the Attenuator Device — what the volume keys and
     /// the Sound settings slider control while it is the system output. Our
@@ -216,8 +217,16 @@ final class MixerController: ObservableObject {
         }
         let p = relay.takePeaks()
         let b = relay.backlogs
-        log(String(format: "levels: fallback=%.4f tapmix=%.4f out=%.4f | backlog fb=%d taps=%d",
-                   p.fallback, p.tapMix, p.output, b.fallback, b.taps))
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastLevelReport)
+        lastLevelReport = now
+        let c = relay.takeFrameCounts()
+        // Rates should all sit at the pipeline rate; one that does not is how a
+        // pitch shift gets in, since nothing in the rings resamples.
+        let rate: (Int) -> String = { elapsed > 0.1 ? String(format: "%.0f", Double($0) / elapsed) : "?" }
+        log(String(format: "levels: fallback=%.4f tapmix=%.4f out=%.4f | backlog fb=%d taps=%d | Hz fb=%@ tap=%@ out=%@",
+                   p.fallback, p.tapMix, p.output, b.fallback, b.taps,
+                   rate(c.fallback), rate(c.taps), rate(c.output)))
     }
 
     func stop() {
@@ -256,29 +265,19 @@ final class MixerController: ObservableObject {
             return
         }
 
+        // Prefer running the device at the pipeline rate so no conversion is
+        // needed, but do not require it: the output unit resamples for devices
+        // that cannot do 48kHz, which includes most Bluetooth headsets.
         trySetNominalSampleRate(outputID, rate: kSampleRate)
-        guard let format = queryStreamFormat(outputID, scope: kAudioObjectPropertyScopeOutput) else {
-            status = "Could not read output device format"
-            isRunning = false
-            log("could not read output device format")
-            return
-        }
-
-        let channels = Int(format.mChannelsPerFrame)
-        let isFloat = (format.mFormatID == kAudioFormatLinearPCM) && (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0
-        let isInterleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
-        guard isFloat, isInterleaved, channels >= 2 else {
-            status = "Output device format unsupported (needs interleaved Float32, ≥2ch)"
-            isRunning = false
-            log("unsupported output format: ch=\(channels) float=\(isFloat) interleaved=\(isInterleaved)")
-            return
+        if let format = queryStreamFormat(outputID, scope: kAudioObjectPropertyScopeOutput) {
+            log("output format: \(format.mChannelsPerFrame)ch @ \(format.mSampleRate)Hz"
+                + (abs(format.mSampleRate - kSampleRate) > 0.5 ? " (output unit will resample)" : ""))
         }
 
         do {
             let newRelay = try AudioRelay(
                 fallbackDeviceID: fallbackID,
-                outputDeviceID: outputID,
-                outputChannels: channels
+                outputDeviceID: outputID
             )
             try newRelay.start()
             watchSystemVolume(on: fallbackID)
@@ -288,7 +287,7 @@ final class MixerController: ObservableObject {
             openedOutputID = outputID
             isRunning = true
             status = "Routing to \(getDeviceName(outputID))"
-            log("relay started -> \(getDeviceName(outputID)) (\(channels)ch)")
+            log("relay started -> \(getDeviceName(outputID))")
             applyGains()
             rebuildTaps()
         } catch {

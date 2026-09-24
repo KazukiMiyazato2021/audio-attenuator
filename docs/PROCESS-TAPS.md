@@ -160,6 +160,25 @@ volumes against a 0.3-amplitude tone:
 | 20%  | 0.0600 | 0.0000 |
 | 0%   | 0.0000 | 0.0000 |
 
+## Output must go through a HAL output unit, not a raw IOProc
+
+The pipeline runs at a fixed 48kHz. Writing those frames straight into a device
+running at a different rate plays them at the wrong speed: at 44.1kHz they run
+~8.8% slow, which is about 1.5 semitones flat and very audible on speech. Most
+Bluetooth headsets only do 44.1kHz, so the built-in speakers (which do 48kHz)
+hide this completely.
+
+Setting `kAudioDevicePropertyNominalSampleRate` to 48000 is still worth trying,
+but it cannot be relied on. Output therefore goes through a
+`kAudioUnitSubType_HALOutput` unit with its *input* format fixed at 48kHz
+stereo Float32: the unit resamples and remaps channels to whatever the device
+needs. That also removes the need to reject devices that are not interleaved
+Float32 stereo.
+
+`MixerController` logs each path's measured frame rate, so a rate mismatch
+shows up as a number other than ~48000 rather than as a sound someone has to
+notice.
+
 ## Gotchas when testing
 
 - The audio source must be a **single stable process**. A tap binds to
