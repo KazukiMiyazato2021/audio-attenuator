@@ -171,13 +171,8 @@ guard let outFormat = queryStreamFormat(outputDeviceID, scope: kAudioObjectPrope
 }
 print("Output format: \(outFormat.mChannelsPerFrame)ch @ \(outFormat.mSampleRate)Hz")
 
-let outChannels = Int(outFormat.mChannelsPerFrame)
-let outIsFloat = (outFormat.mFormatID == kAudioFormatLinearPCM) && (outFormat.mFormatFlags & kAudioFormatFlagIsFloat) != 0
-let outIsInterleaved = (outFormat.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
-
-if !outIsFloat || !outIsInterleaved || outChannels < 2 {
-    FileHandle.standardError.write("Output device format unsupported: needs interleaved Float32 with >=2 channels (got channels=\(outChannels) float=\(outIsFloat) interleaved=\(outIsInterleaved)).\n".data(using: .utf8)!)
-    exit(1)
+if abs(outFormat.mSampleRate - kSampleRate) > 0.5 {
+    print("Output runs at \(outFormat.mSampleRate)Hz; the output unit will resample from \(kSampleRate)Hz.")
 }
 
 // MARK: - Set up taps
@@ -212,8 +207,7 @@ let relay: AudioRelay
 do {
     relay = try AudioRelay(
         fallbackDeviceID: fallbackDeviceID,
-        outputDeviceID: outputDeviceID,
-        outputChannels: outChannels
+        outputDeviceID: outputDeviceID
     )
 } catch {
     FileHandle.standardError.write("Relay setup failed: \(error)\n".data(using: .utf8)!)

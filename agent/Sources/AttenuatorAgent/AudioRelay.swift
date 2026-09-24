@@ -29,7 +29,6 @@ final class AudioRelay {
 
     private let fallbackDeviceID: AudioObjectID
     private let outputDeviceID: AudioObjectID
-    private let outputChannels: Int
 
     private let fallbackRing: OpaquePointer
     private let tapMixRing: OpaquePointer
@@ -44,6 +43,14 @@ final class AudioRelay {
     private static let meterTapMix = 0
     private static let meterFallback = 1
     private static let meterOutput = 2
+    /// Frames each path has moved since the last report. Every path should run
+    /// at the pipeline's fixed rate; a path running at a different rate is how
+    /// a pitch shift gets in, since samples are passed through one-for-one and
+    /// nothing resamples them.
+    private static let counterFallbackFrames = 4
+    private static let counterTapFrames = 5
+    private static let counterOutputFrames = 6
+    private static let meterSlots = 7
 
     /// Scratch space for the aggregate IOProc to accumulate its gain-applied
     /// stereo mix, and for the output IOProc to pull each ring into. Allocated
@@ -54,10 +61,24 @@ final class AudioRelay {
     private let scratchFrames: Int
 
     private var fallbackProcID: AudioDeviceIOProcID?
-    private var outputProcID: AudioDeviceIOProcID?
+    private var outputUnit: AudioUnit?
 
     private var aggregateProcID: AudioDeviceIOProcID?
     private var attachedAggregateID: AudioObjectID = kAudioObjectUnknown
+
+    /// Frames moved per path since the last call, then reset. Divided by the
+    /// elapsed time this gives each path's real sample rate.
+    func takeFrameCounts() -> (fallback: Int, taps: Int, output: Int) {
+        let result = (
+            Int(catt_gain_store_get(meters, Self.counterFallbackFrames)),
+            Int(catt_gain_store_get(meters, Self.counterTapFrames)),
+            Int(catt_gain_store_get(meters, Self.counterOutputFrames))
+        )
+        catt_gain_store_set(meters, Self.counterFallbackFrames, 0)
+        catt_gain_store_set(meters, Self.counterTapFrames, 0)
+        catt_gain_store_set(meters, Self.counterOutputFrames, 0)
+        return result
+    }
 
     /// Read by the output IOProc to decide whether to pull the tap ring.
     /// Stored in the atomic meter table so the audio thread never reads a
@@ -70,25 +91,23 @@ final class AudioRelay {
     init(
         fallbackDeviceID: AudioObjectID,
         outputDeviceID: AudioObjectID,
-        outputChannels: Int,
         maxFramesPerCallback: Int = 8192
     ) throws {
         self.fallbackDeviceID = fallbackDeviceID
         self.outputDeviceID = outputDeviceID
-        self.outputChannels = outputChannels
         self.scratchFrames = maxFramesPerCallback
 
         guard let fallbackRing = catt_ring_buffer_create(kRingBufferFrames, Int(kChannels)),
               let tapMixRing = catt_ring_buffer_create(kRingBufferFrames, Int(kChannels)),
               let gains = catt_gain_store_create(Self.maxTaps + 2),
-              let meters = catt_gain_store_create(4) else {
+              let meters = catt_gain_store_create(Self.meterSlots) else {
             throw RelayError.allocationFailed
         }
         self.fallbackRing = fallbackRing
         self.tapMixRing = tapMixRing
         self.gains = gains
         self.meters = meters
-        for slot in 0..<4 { catt_gain_store_set(meters, slot, 0) }
+        for slot in 0..<Self.meterSlots { catt_gain_store_set(meters, slot, 0) }
 
         let scratchSamples = maxFramesPerCallback * Int(kChannels)
         tapScratch = .allocate(capacity: scratchSamples)
@@ -155,6 +174,7 @@ final class AudioRelay {
     /// lifetime of the relay; the tap section comes and goes around them.
     func start() throws {
         let ring = fallbackRing
+        let meterStore = meters
         let scratchCap = scratchFrames * Int(kChannels)
 
         var fallbackID: AudioDeviceIOProcID?
@@ -166,84 +186,148 @@ final class AudioRelay {
             data.withMemoryRebound(to: Float32.self, capacity: frames * Int(kChannels)) { ptr in
                 _ = catt_ring_buffer_write(ring, ptr, frames)
             }
+            catt_gain_store_set(meterStore, Self.counterFallbackFrames,
+                                catt_gain_store_get(meterStore, Self.counterFallbackFrames) + Float(frames))
         }
         guard fallbackStatus == noErr, let fallbackID else {
             throw RelayError.ioProcCreationFailed("fallback capture", fallbackStatus)
         }
         fallbackProcID = fallbackID
 
-        let tapRing = tapMixRing
-        let gainStore = gains
-        let meterStore = meters
-        let fbScratch = fallbackScratch
-        let mix = mixScratch
-        let outChannels = outputChannels
-        let fbSlot = fallbackGainSlot
-        let mSlot = masterGainSlot
-        let activeSlot = tapActiveSlot
+        // --- Output: sum both paths, apply master, clamp, hand to the device ---
+        //
+        // Output goes through a HAL Output AudioUnit rather than a raw IOProc
+        // so the unit converts our fixed 48kHz stereo mix to whatever rate the
+        // device actually runs at. Writing 48kHz frames straight into a device
+        // running at 44.1kHz — which is what most Bluetooth headsets do — plays
+        // them ~8.8% slow, about 1.5 semitones flat.
+        try startOutputUnit()
 
-        var outID: AudioDeviceIOProcID?
-        let outStatus = AudioDeviceCreateIOProcIDWithBlock(&outID, outputDeviceID, nil) { _, _, _, outOutputData, _ in
-            let list = UnsafeMutableAudioBufferListPointer(outOutputData)
-            guard let buffer = list.first, let data = buffer.mData else { return }
-            let frames = Int(buffer.mDataByteSize) / (outChannels * MemoryLayout<Float32>.size)
-            guard frames > 0, frames * Int(kChannels) <= scratchCap else { return }
-
-            let sampleCount = frames * Int(kChannels)
-            _ = catt_ring_buffer_read(ring, fbScratch, frames)
-            if catt_gain_store_get(meterStore, activeSlot) > 0.5 {
-                _ = catt_ring_buffer_read(tapRing, mix, frames)
-            } else {
-                mix.update(repeating: 0, count: sampleCount)
-            }
-
-            let fallbackGain = catt_gain_store_get(gainStore, fbSlot)
-            let master = catt_gain_store_get(gainStore, mSlot)
-
-            // Tap contributions already carry their per-app gain; the fallback
-            // stream gets its own gain here. Master scales the sum. Boosts
-            // above 100% can clip, so hard-limit to [-1, 1] — the same
-            // trade-off a Windows-style per-app mixer makes.
-            var fbPeak: Float32 = 0
-            var outPeak: Float32 = 0
-            for i in 0..<sampleCount {
-                fbPeak = max(fbPeak, abs(fbScratch[i]))
-                var v = (fbScratch[i] * fallbackGain + mix[i]) * master
-                if v > 1.0 { v = 1.0 } else if v < -1.0 { v = -1.0 }
-                mix[i] = v
-                outPeak = max(outPeak, abs(v))
-            }
-            if fbPeak > catt_gain_store_get(meterStore, Self.meterFallback) {
-                catt_gain_store_set(meterStore, Self.meterFallback, fbPeak)
-            }
-            if outPeak > catt_gain_store_get(meterStore, Self.meterOutput) {
-                catt_gain_store_set(meterStore, Self.meterOutput, outPeak)
-            }
-
-            data.withMemoryRebound(to: Float32.self, capacity: frames * outChannels) { ptr in
-                if outChannels == Int(kChannels) {
-                    ptr.update(from: mix, count: sampleCount)
-                } else {
-                    for f in 0..<frames {
-                        for ch in 0..<outChannels {
-                            ptr[f * outChannels + ch] = ch < Int(kChannels) ? mix[f * Int(kChannels) + ch] : 0
-                        }
-                    }
-                }
-            }
-        }
-        guard outStatus == noErr, let outID else {
-            throw RelayError.ioProcCreationFailed("output", outStatus)
-        }
-        outputProcID = outID
 
         // Start capture before output so the output never runs dry waiting for
         // its first frames.
         let fbStart = AudioDeviceStart(fallbackDeviceID, fallbackID)
         guard fbStart == noErr else { throw RelayError.startFailed("fallback capture", fbStart) }
 
-        let outStart = AudioDeviceStart(outputDeviceID, outID)
-        guard outStart == noErr else { throw RelayError.startFailed("output", outStart) }
+        guard let unit = outputUnit else { throw RelayError.outputUnitFailed("unit missing", noErr) }
+        let unitStart = AudioOutputUnitStart(unit)
+        guard unitStart == noErr else { throw RelayError.startFailed("output unit", unitStart) }
+    }
+
+    /// Builds the HAL output unit: bound to the chosen device, fed by a render
+    /// callback in the pipeline's fixed format, converting on the way out.
+    private func startOutputUnit() throws {
+        var description = AudioComponentDescription(
+            componentType: kAudioUnitType_Output,
+            componentSubType: kAudioUnitSubType_HALOutput,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+        guard let component = AudioComponentFindNext(nil, &description) else {
+            throw RelayError.outputUnitFailed("no HAL output component", noErr)
+        }
+
+        var unit: AudioUnit?
+        var status = AudioComponentInstanceNew(component, &unit)
+        guard status == noErr, let unit else {
+            throw RelayError.outputUnitFailed("AudioComponentInstanceNew", status)
+        }
+        outputUnit = unit
+
+        var device = outputDeviceID
+        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                      kAudioUnitScope_Global, 0, &device,
+                                      UInt32(MemoryLayout<AudioObjectID>.size))
+        guard status == noErr else {
+            throw RelayError.outputUnitFailed("set CurrentDevice", status)
+        }
+
+        // Our side of the unit is always the pipeline format; the unit handles
+        // the device's own rate and channel count.
+        var format = AudioStreamBasicDescription(
+            mSampleRate: kSampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagsNativeFloatPacked,
+            mBytesPerPacket: UInt32(Int(kChannels) * MemoryLayout<Float32>.size),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(Int(kChannels) * MemoryLayout<Float32>.size),
+            mChannelsPerFrame: kChannels,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        status = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
+                                      kAudioUnitScope_Input, 0, &format,
+                                      UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
+        guard status == noErr else {
+            throw RelayError.outputUnitFailed("set input StreamFormat", status)
+        }
+
+        var callback = AURenderCallbackStruct(
+            inputProc: { refCon, _, _, _, frameCount, ioData in
+                let relay = Unmanaged<AudioRelay>.fromOpaque(refCon).takeUnretainedValue()
+                return relay.render(frameCount: Int(frameCount), ioData: ioData)
+            },
+            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
+        )
+        status = AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback,
+                                      kAudioUnitScope_Input, 0, &callback,
+                                      UInt32(MemoryLayout<AURenderCallbackStruct>.size))
+        guard status == noErr else {
+            throw RelayError.outputUnitFailed("set render callback", status)
+        }
+
+        status = AudioUnitInitialize(unit)
+        guard status == noErr else {
+            throw RelayError.outputUnitFailed("AudioUnitInitialize", status)
+        }
+    }
+
+    /// Render callback body. Allocation-, lock- and syscall-free: gains come
+    /// from the atomic table and audio from the lock-free rings.
+    private func render(frameCount: Int, ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
+        guard let ioData else { return noErr }
+        let list = UnsafeMutableAudioBufferListPointer(ioData)
+        guard let buffer = list.first, let data = buffer.mData else { return noErr }
+        guard frameCount > 0, frameCount <= scratchFrames else { return noErr }
+
+        let sampleCount = frameCount * Int(kChannels)
+        _ = catt_ring_buffer_read(fallbackRing, fallbackScratch, frameCount)
+        if catt_gain_store_get(meters, tapActiveSlot) > 0.5 {
+            _ = catt_ring_buffer_read(tapMixRing, mixScratch, frameCount)
+        } else {
+            mixScratch.update(repeating: 0, count: sampleCount)
+        }
+
+        let fallbackGainValue = catt_gain_store_get(gains, Self.maxTaps)
+        let masterValue = catt_gain_store_get(gains, Self.maxTaps + 1)
+
+        // Tap contributions already carry their per-app gain; the fallback
+        // stream gets its own gain here. Master scales the sum. Boosts above
+        // 100% can clip, so hard-limit to [-1, 1] — the same trade-off a
+        // Windows-style per-app mixer makes.
+        var fbPeak: Float32 = 0
+        var outPeak: Float32 = 0
+        for i in 0..<sampleCount {
+            fbPeak = max(fbPeak, abs(fallbackScratch[i]))
+            var v = (fallbackScratch[i] * fallbackGainValue + mixScratch[i]) * masterValue
+            if v > 1.0 { v = 1.0 } else if v < -1.0 { v = -1.0 }
+            mixScratch[i] = v
+            outPeak = max(outPeak, abs(v))
+        }
+        if fbPeak > catt_gain_store_get(meters, Self.meterFallback) {
+            catt_gain_store_set(meters, Self.meterFallback, fbPeak)
+        }
+        if outPeak > catt_gain_store_get(meters, Self.meterOutput) {
+            catt_gain_store_set(meters, Self.meterOutput, outPeak)
+        }
+        catt_gain_store_set(meters, Self.counterOutputFrames,
+                            catt_gain_store_get(meters, Self.counterOutputFrames) + Float(frameCount))
+
+        data.withMemoryRebound(to: Float32.self, capacity: sampleCount) { ptr in
+            ptr.update(from: mixScratch, count: sampleCount)
+        }
+        return noErr
     }
 
     /// Attaches a tap aggregate. Replaces any previously attached one.
@@ -301,6 +385,8 @@ final class AudioRelay {
                 catt_gain_store_set(meterStore, Self.meterTapMix, peak)
             }
 
+            catt_gain_store_set(meterStore, Self.counterTapFrames,
+                                catt_gain_store_get(meterStore, Self.counterTapFrames) + Float(frames))
             _ = catt_ring_buffer_write(tapRing, scratch, frames)
         }
         guard status == noErr, let aggID else {
@@ -334,10 +420,11 @@ final class AudioRelay {
 
     func stop() {
         detachTapAggregate()
-        if let outputProcID {
-            AudioDeviceStop(outputDeviceID, outputProcID)
-            AudioDeviceDestroyIOProcID(outputDeviceID, outputProcID)
-            self.outputProcID = nil
+        if let outputUnit {
+            AudioOutputUnitStop(outputUnit)
+            AudioUnitUninitialize(outputUnit)
+            AudioComponentInstanceDispose(outputUnit)
+            self.outputUnit = nil
         }
         if let fallbackProcID {
             AudioDeviceStop(fallbackDeviceID, fallbackProcID)
@@ -351,6 +438,7 @@ enum RelayError: Error, CustomStringConvertible {
     case allocationFailed
     case ioProcCreationFailed(String, OSStatus)
     case startFailed(String, OSStatus)
+    case outputUnitFailed(String, OSStatus)
 
     var description: String {
         switch self {
@@ -360,6 +448,8 @@ enum RelayError: Error, CustomStringConvertible {
             return "Failed to create \(which) IOProc (status \(status))"
         case .startFailed(let which, let status):
             return "Failed to start \(which) (status \(status))"
+        case .outputUnitFailed(let step, let status):
+            return "Output unit setup failed at \(step) (status \(status))"
         }
     }
 }
