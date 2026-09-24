@@ -27,6 +27,22 @@ final class AudioRelay {
     /// read from. Far more than anyone will assign individual volumes to.
     static let maxTaps = 64
 
+    /// Latency budget for the rings. A transient — startup, a device switch, a
+    /// Bluetooth headset connecting — can leave far more audio queued than the
+    /// pipeline needs, and since producer and consumer then run at the same
+    /// rate nothing ever drains it: the backlog becomes permanent delay. Once
+    /// the queue passes the high-water mark the oldest audio is discarded back
+    /// down to the target, trading one brief discontinuity for bounded latency.
+    private static let targetBacklogFrames = 1536   // ~32ms at 48kHz
+    /// Above this, drop the excess in one go: something big happened and a
+    /// single short discontinuity beats carrying the delay indefinitely.
+    private static let maxBacklogFrames = 8192      // ~170ms at 48kHz
+    /// Between target and max, shed a few frames per callback instead. At well
+    /// under a percent of a buffer this is inaudible, where dropping thousands
+    /// at once would be a clearly audible gap.
+    private static let gentleTrimFramesPerCallback = 4
+    private static let trimDeadband = 512           // ~11ms of slack
+
     private let fallbackDeviceID: AudioObjectID
     private let outputDeviceID: AudioObjectID
 
@@ -65,6 +81,19 @@ final class AudioRelay {
 
     private var aggregateProcID: AudioDeviceIOProcID?
     private var attachedAggregateID: AudioObjectID = kAudioObjectUnknown
+
+    /// Discards backlog above the high-water mark. Real-time safe: only moves
+    /// a read index.
+    private func trimIfBacklogged(_ ring: OpaquePointer) {
+        let available = catt_ring_buffer_available_for_read(ring)
+        if available > Self.maxBacklogFrames {
+            _ = catt_ring_buffer_drop(ring, available - Self.targetBacklogFrames)
+            return
+        }
+        let slack = Self.targetBacklogFrames + Self.trimDeadband
+        guard available > slack else { return }
+        _ = catt_ring_buffer_drop(ring, min(Self.gentleTrimFramesPerCallback, available - slack))
+    }
 
     /// Frames moved per path since the last call, then reset. Divided by the
     /// elapsed time this gives each path's real sample rate.
@@ -281,6 +310,26 @@ final class AudioRelay {
         guard status == noErr else {
             throw RelayError.outputUnitFailed("AudioUnitInitialize", status)
         }
+
+        // Report what the unit actually settled on. If the input side is not at
+        // the pipeline rate, the unit is not converting and audio will play at
+        // the wrong speed — worth seeing in the log rather than hearing.
+        negotiatedFormats = readNegotiatedFormats(unit)
+    }
+
+    /// The formats the output unit ended up with: `input` is our side, `output`
+    /// is the device's. They differ when the unit is resampling.
+    private(set) var negotiatedFormats: (input: AudioStreamBasicDescription, output: AudioStreamBasicDescription)?
+
+    private func readNegotiatedFormats(_ unit: AudioUnit) -> (AudioStreamBasicDescription, AudioStreamBasicDescription)? {
+        var input = AudioStreamBasicDescription()
+        var inSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var output = AudioStreamBasicDescription()
+        var outSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        guard AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &input, &inSize) == noErr,
+              AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &output, &outSize) == noErr
+        else { return nil }
+        return (input, output)
     }
 
     /// Render callback body. Allocation-, lock- and syscall-free: gains come
@@ -292,8 +341,11 @@ final class AudioRelay {
         guard frameCount > 0, frameCount <= scratchFrames else { return noErr }
 
         let sampleCount = frameCount * Int(kChannels)
+
+        trimIfBacklogged(fallbackRing)
         _ = catt_ring_buffer_read(fallbackRing, fallbackScratch, frameCount)
         if catt_gain_store_get(meters, tapActiveSlot) > 0.5 {
+            trimIfBacklogged(tapMixRing)
             _ = catt_ring_buffer_read(tapMixRing, mixScratch, frameCount)
         } else {
             mixScratch.update(repeating: 0, count: sampleCount)

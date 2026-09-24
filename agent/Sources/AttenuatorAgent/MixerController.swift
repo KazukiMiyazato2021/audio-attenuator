@@ -32,6 +32,13 @@ final class MixerController: ObservableObject {
     @Published private(set) var apps: [AppRow] = []
     @Published private(set) var status: String = "Starting…"
     @Published private(set) var isRunning = false
+    /// True when macOS is sending system audio somewhere other than the
+    /// Attenuator Device. Everything still "works" in that state, it just has
+    /// no audio to work on — apps play straight to the other device and per-app
+    /// volume quietly stops applying. macOS switches the default output by
+    /// itself when, for example, a Bluetooth headset connects, so this needs
+    /// saying out loud rather than leaving the user to wonder.
+    @Published private(set) var isSystemOutput = true
     @Published private(set) var outputDevices: [OutputDeviceInfo] = []
     @Published var selectedOutputUID: String? {
         didSet {
@@ -265,10 +272,12 @@ final class MixerController: ObservableObject {
             return
         }
 
-        // Prefer running the device at the pipeline rate so no conversion is
-        // needed, but do not require it: the output unit resamples for devices
-        // that cannot do 48kHz, which includes most Bluetooth headsets.
-        trySetNominalSampleRate(outputID, rate: kSampleRate)
+        // Deliberately does *not* force the device to the pipeline rate.
+        // Bluetooth headsets accept a 48kHz nominal rate while the A2DP link
+        // keeps running at 44.1kHz, so forcing it plays everything ~8.8% slow —
+        // about 1.5 semitones flat — with no error anywhere to show for it.
+        // Leaving the device at its own rate lets the output unit resample,
+        // which it does correctly.
         if let format = queryStreamFormat(outputID, scope: kAudioObjectPropertyScopeOutput) {
             log("output format: \(format.mChannelsPerFrame)ch @ \(format.mSampleRate)Hz"
                 + (abs(format.mSampleRate - kSampleRate) > 0.5 ? " (output unit will resample)" : ""))
@@ -288,6 +297,14 @@ final class MixerController: ObservableObject {
             isRunning = true
             status = "Routing to \(getDeviceName(outputID))"
             log("relay started -> \(getDeviceName(outputID))")
+            if let f = newRelay.negotiatedFormats {
+                let converting = abs(f.input.mSampleRate - f.output.mSampleRate) > 0.5
+                log("output unit: our side \(f.input.mChannelsPerFrame)ch @ \(f.input.mSampleRate)Hz"
+                    + " -> device \(f.output.mChannelsPerFrame)ch @ \(f.output.mSampleRate)Hz"
+                    + (converting ? " (resampling)" : ""))
+            } else {
+                log("output unit: could not read negotiated formats")
+            }
             applyGains()
             rebuildTaps()
         } catch {
@@ -387,6 +404,7 @@ final class MixerController: ObservableObject {
 
     private func refreshApps() {
         outputDevices = listOutputDevices()
+        updateSystemOutputState()
 
         // Collapse the several audio processes an app can have (browser helper
         // and GPU processes share the parent's bundle ID) into one row, so the
@@ -421,6 +439,29 @@ final class MixerController: ObservableObject {
             return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
         }
         if sorted != apps { apps = sorted }
+    }
+
+    private func updateSystemOutputState() {
+        let attenuatorID = findDeviceByUID(kAttenuatorDeviceUID)
+        let isOurs = defaultOutputDeviceID() == attenuatorID && attenuatorID != nil
+        guard isOurs != isSystemOutput else { return }
+        isSystemOutput = isOurs
+        log("system output is \(isOurs ? "Attenuator Device" : "NOT Attenuator Device — audio bypasses the mixer")")
+    }
+
+    /// Points macOS back at the Attenuator Device, for the one-click fix in the UI.
+    func makeSystemOutput() {
+        guard let deviceID = findDeviceByUID(kAttenuatorDeviceUID) else { return }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var id = deviceID
+        let status = AudioObjectSetPropertyData(kSystemObject, &address, 0, nil,
+                                                UInt32(MemoryLayout<AudioObjectID>.size), &id)
+        log("set system output to Attenuator Device: status \(status)")
+        updateSystemOutputState()
     }
 
     // MARK: - Volume changes

@@ -106,6 +106,17 @@ size_t catt_ring_buffer_read(CattRingBuffer* rb, float* data, size_t frameCount)
     return framesToRead;
 }
 
+size_t catt_ring_buffer_drop(CattRingBuffer* rb, size_t frameCount) {
+    size_t available = catt_ring_buffer_available_for_read(rb);
+    size_t framesToDrop = (frameCount > available) ? available : frameCount;
+    if (framesToDrop == 0) return 0;
+
+    size_t readIdx = atomic_load_explicit(&rb->readPos, memory_order_relaxed);
+    size_t newReadPos = (readIdx + framesToDrop * rb->channels) % rb->capacitySamples;
+    atomic_store_explicit(&rb->readPos, newReadPos, memory_order_release);
+    return framesToDrop;
+}
+
 void catt_ring_buffer_clear(CattRingBuffer* rb) {
     atomic_store_explicit(&rb->writePos, 0, memory_order_relaxed);
     atomic_store_explicit(&rb->readPos, 0, memory_order_relaxed);

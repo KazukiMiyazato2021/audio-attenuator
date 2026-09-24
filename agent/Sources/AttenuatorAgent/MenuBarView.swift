@@ -8,6 +8,10 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
+            if !controller.isSystemOutput {
+                Divider()
+                bypassWarning
+            }
             Divider()
             globalControls
             Divider()
@@ -33,6 +37,29 @@ struct MenuBarView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
+    }
+
+    /// Without this the app looks like it is working while doing nothing:
+    /// macOS can move the system output elsewhere on its own (connecting a
+    /// Bluetooth headset does it), and from then on no audio reaches the mixer.
+    private var bypassWarning: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("System audio is not going through Attenuator")
+                    .font(.caption)
+                Text("Per-app volume has no effect until it is.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Fix") { controller.makeSystemOutput() }
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
     }
 
     private var globalControls: some View {
