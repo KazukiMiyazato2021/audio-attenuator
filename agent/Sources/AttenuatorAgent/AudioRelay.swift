@@ -33,15 +33,19 @@ final class AudioRelay {
     /// rate nothing ever drains it: the backlog becomes permanent delay. Once
     /// the queue passes the high-water mark the oldest audio is discarded back
     /// down to the target, trading one brief discontinuity for bounded latency.
-    private static let targetBacklogFrames = 1536   // ~32ms at 48kHz
+    private static let targetBacklogFrames = 768    // ~16ms at 48kHz
     /// Above this, drop the excess in one go: something big happened and a
     /// single short discontinuity beats carrying the delay indefinitely.
-    private static let maxBacklogFrames = 8192      // ~170ms at 48kHz
+    private static let maxBacklogFrames = 3072      // ~64ms at 48kHz
     /// Between target and max, shed a few frames per callback instead. At well
     /// under a percent of a buffer this is inaudible, where dropping thousands
     /// at once would be a clearly audible gap.
+    /// What the mixer itself adds: the ring it keeps plus the driver's own
+    /// writer-to-reader offset. Reported upstream so apps can line video up.
+    static let pipelineLatencyFrames: UInt32 = UInt32(targetBacklogFrames) + 512
+
     private static let gentleTrimFramesPerCallback = 4
-    private static let trimDeadband = 512           // ~11ms of slack
+    private static let trimDeadband = 256           // ~5ms of slack
 
     private let fallbackDeviceID: AudioObjectID
     private let outputDeviceID: AudioObjectID
@@ -66,7 +70,15 @@ final class AudioRelay {
     private static let counterFallbackFrames = 4
     private static let counterTapFrames = 5
     private static let counterOutputFrames = 6
-    private static let meterSlots = 7
+    /// Callbacks that could not be filled from the ring and were padded with
+    /// silence. Trimming latency too aggressively shows up here first, so this
+    /// is what says whether a lower target is actually safe.
+    private static let counterUnderruns = 7
+    /// Set when IO starts so the render path drops whatever piled up before
+    /// the output began pulling. Done from the render callback rather than the
+    /// control thread because only the consumer may move the read index.
+    private static let flushRequest = 8
+    private static let meterSlots = 9
 
     /// Scratch space for the aggregate IOProc to accumulate its gain-applied
     /// stereo mix, and for the output IOProc to pull each ring into. Allocated
@@ -84,6 +96,12 @@ final class AudioRelay {
 
     /// Discards backlog above the high-water mark. Real-time safe: only moves
     /// a read index.
+    private func flushToTarget(_ ring: OpaquePointer) {
+        let available = catt_ring_buffer_available_for_read(ring)
+        guard available > Self.targetBacklogFrames else { return }
+        _ = catt_ring_buffer_drop(ring, available - Self.targetBacklogFrames)
+    }
+
     private func trimIfBacklogged(_ ring: OpaquePointer) {
         let available = catt_ring_buffer_available_for_read(ring)
         if available > Self.maxBacklogFrames {
@@ -97,15 +115,17 @@ final class AudioRelay {
 
     /// Frames moved per path since the last call, then reset. Divided by the
     /// elapsed time this gives each path's real sample rate.
-    func takeFrameCounts() -> (fallback: Int, taps: Int, output: Int) {
+    func takeFrameCounts() -> (fallback: Int, taps: Int, output: Int, underruns: Int) {
         let result = (
             Int(catt_gain_store_get(meters, Self.counterFallbackFrames)),
             Int(catt_gain_store_get(meters, Self.counterTapFrames)),
-            Int(catt_gain_store_get(meters, Self.counterOutputFrames))
+            Int(catt_gain_store_get(meters, Self.counterOutputFrames)),
+            Int(catt_gain_store_get(meters, Self.counterUnderruns))
         )
         catt_gain_store_set(meters, Self.counterFallbackFrames, 0)
         catt_gain_store_set(meters, Self.counterTapFrames, 0)
         catt_gain_store_set(meters, Self.counterOutputFrames, 0)
+        catt_gain_store_set(meters, Self.counterUnderruns, 0)
         return result
     }
 
@@ -241,6 +261,7 @@ final class AudioRelay {
         guard let unit = outputUnit else { throw RelayError.outputUnitFailed("unit missing", noErr) }
         let unitStart = AudioOutputUnitStart(unit)
         guard unitStart == noErr else { throw RelayError.startFailed("output unit", unitStart) }
+        catt_gain_store_set(meters, Self.flushRequest, 1)
     }
 
     /// Builds the HAL output unit: bound to the chosen device, fed by a render
@@ -342,8 +363,22 @@ final class AudioRelay {
 
         let sampleCount = frameCount * Int(kChannels)
 
+        if catt_gain_store_get(meters, Self.flushRequest) > 0.5 {
+            catt_gain_store_set(meters, Self.flushRequest, 0)
+            // Capture runs from the moment the device opens, but the output
+            // unit only starts pulling once it is ready. Everything queued in
+            // between is audio nobody has heard yet, and keeping it would just
+            // be latency carried for the rest of the session.
+            flushToTarget(fallbackRing)
+            flushToTarget(tapMixRing)
+        }
+
         trimIfBacklogged(fallbackRing)
-        _ = catt_ring_buffer_read(fallbackRing, fallbackScratch, frameCount)
+        let gotFallback = catt_ring_buffer_read(fallbackRing, fallbackScratch, frameCount)
+        if gotFallback < frameCount {
+            catt_gain_store_set(meters, Self.counterUnderruns,
+                                catt_gain_store_get(meters, Self.counterUnderruns) + 1)
+        }
         if catt_gain_store_get(meters, tapActiveSlot) > 0.5 {
             trimIfBacklogged(tapMixRing)
             _ = catt_ring_buffer_read(tapMixRing, mixScratch, frameCount)
@@ -454,6 +489,7 @@ final class AudioRelay {
         aggregateProcID = aggID
         attachedAggregateID = deviceID
         catt_gain_store_set(meters, tapActiveSlot, 1)
+        catt_gain_store_set(meters, Self.flushRequest, 1)
     }
 
     func detachTapAggregate() {

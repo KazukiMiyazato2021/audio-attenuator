@@ -217,6 +217,20 @@ final class MixerController: ObservableObject {
         return false
     }
 
+    /// Samples the rings every 500ms for the first few seconds after a start,
+    /// where the coarse periodic logging would miss a transient settling.
+    private func traceStartupBacklog() {
+        for step in 1...10 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(step) * 0.5) { [weak self] in
+                guard let self, let relay = self.relay else { return }
+                let b = relay.backlogs
+                self.log(String(format: "startup trace +%.1fs: backlog fb=%d (%.0fms) taps=%d",
+                                Double(step) * 0.5, b.fallback,
+                                Double(b.fallback) / kSampleRate * 1000.0, b.taps))
+            }
+        }
+    }
+
     private func logLevels() {
         guard let relay else {
             log("levels: relay is nil (status: \(status))")
@@ -231,9 +245,10 @@ final class MixerController: ObservableObject {
         // Rates should all sit at the pipeline rate; one that does not is how a
         // pitch shift gets in, since nothing in the rings resamples.
         let rate: (Int) -> String = { elapsed > 0.1 ? String(format: "%.0f", Double($0) / elapsed) : "?" }
-        log(String(format: "levels: fallback=%.4f tapmix=%.4f out=%.4f | backlog fb=%d taps=%d | Hz fb=%@ tap=%@ out=%@",
-                   p.fallback, p.tapMix, p.output, b.fallback, b.taps,
-                   rate(c.fallback), rate(c.taps), rate(c.output)))
+        log(String(format: "levels: fallback=%.4f tapmix=%.4f out=%.4f | backlog fb=%d (%.0fms) taps=%d | Hz fb=%@ tap=%@ out=%@ | underruns=%d",
+                   p.fallback, p.tapMix, p.output,
+                   b.fallback, Double(b.fallback) / kSampleRate * 1000.0, b.taps,
+                   rate(c.fallback), rate(c.taps), rate(c.output), c.underruns))
     }
 
     func stop() {
@@ -290,6 +305,8 @@ final class MixerController: ObservableObject {
             )
             try newRelay.start()
             watchSystemVolume(on: fallbackID)
+            publishLatency(outputDevice: outputID, to: fallbackID)
+            traceStartupBacklog()
             startRetries = 0
             relay = newRelay
             openedFallbackID = fallbackID
@@ -379,7 +396,23 @@ final class MixerController: ObservableObject {
         watchedDeviceID = kAudioObjectUnknown
     }
 
+    /// Converts the output device's latency into our pipeline's frame rate,
+    /// adds what the mixer itself holds, and tells the driver.
+    private func publishLatency(outputDevice: AudioObjectID, to attenuatorID: AudioObjectID) {
+        let deviceFrames = deviceOutputLatencyFrames(outputDevice)
+        let deviceRate = queryStreamFormat(outputDevice, scope: kAudioObjectPropertyScopeOutput)?.mSampleRate ?? kSampleRate
+        // The device counts frames at its own rate; the driver wants ours.
+        let scaled = deviceRate > 0 ? Double(deviceFrames) * kSampleRate / deviceRate : Double(deviceFrames)
+        let total = UInt32(scaled.rounded()) + AudioRelay.pipelineLatencyFrames
+
+        let status = publishDownstreamLatency(toDevice: attenuatorID, frames: total)
+        log(String(format: "published latency: device %u frames @ %.0fHz + pipeline %u = %u frames (%.0fms), status %d",
+                   deviceFrames, deviceRate, AudioRelay.pipelineLatencyFrames, total,
+                   Double(total) / kSampleRate * 1000.0, status))
+    }
+
     private func restartAudio() {
+        log("restarting audio (output device changed)")
         unwatchSystemVolume()
         relay?.stop()
         relay = nil

@@ -179,6 +179,45 @@ Float32 stereo.
 shows up as a number other than ~48000 rather than as a sound someone has to
 notice.
 
+## A virtual device must report its downstream latency
+
+Apps read `kAudioDevicePropertyLatency` from the output device to line video up
+with audio. A virtual device is only the front door — the sound actually leaves
+through whatever the mixer plays into, and a Bluetooth headset can be 200ms+
+behind on its own (RY-WH02 reports 10284 frames at 44.1kHz = 233ms).
+
+Reporting 0, as a passthrough device naturally does, makes every video player
+believe audio is instantaneous, so it does not delay the picture and the audio
+visibly trails it. Playing to the same headset directly has no such problem,
+because then the player sees the real figure.
+
+The mixer therefore measures its output device's latency, converts it to the
+pipeline's frame rate, adds its own buffering, and publishes the total to the
+driver, which reports it as the device's latency.
+
+Getting the value *into* the driver takes some care:
+
+- The HAL rejects client writes to `kAudioDevicePropertyLatency` with `'nope'`
+  before they reach the driver, so a custom selector is required.
+- The HAL only forwards custom selectors a driver has declared through
+  `kAudioObjectPropertyCustomPropertyInfoList`; without that, everything else
+  is `'who?'`, including `AudioObjectHasProperty`.
+- Custom properties carry only `CFString` or `CFPropertyList`, so a frame count
+  travels as a `CFNumber`, not a `UInt32`.
+
+## Latency picked up during a transient is permanent unless it is dropped
+
+Capture starts as soon as the device opens, while the output unit only begins
+pulling once it is ready. Everything queued in between is audio nobody has
+heard, and because producer and consumer then run at the same rate, nothing
+drains it — measured 105ms after a device switch and 403ms after one Bluetooth
+start, both staying put.
+
+The render path drops that backlog on its first callback after IO starts, and
+sheds a few frames per callback whenever the queue sits above target. Tune it
+against the underrun counter rather than by ear: trimming too hard turns
+latency into dropouts, which are worse.
+
 ## Gotchas when testing
 
 - The audio source must be a **single stable process**. A tap binds to
