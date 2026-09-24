@@ -285,3 +285,49 @@ func removeDevicePropertyListener(
     )
     AudioObjectRemovePropertyListenerBlock(deviceID, &address, DispatchQueue.main, block)
 }
+
+// MARK: - Latency
+
+/// A device's reported output latency in frames, plus its safety offset.
+func deviceOutputLatencyFrames(_ deviceID: AudioObjectID) -> UInt32 {
+    func read(_ selector: AudioObjectPropertySelector) -> UInt32 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr else { return 0 }
+        return value
+    }
+    return read(kAudioDevicePropertyLatency) + read(kAudioDevicePropertySafetyOffset)
+}
+
+/// Tells the Attenuator Device how far behind the real output is, so that apps
+/// asking it for latency get a truthful answer.
+///
+/// Without this, every app sees the virtual device's own latency — effectively
+/// zero — and video players line video up against that. Play through a
+/// Bluetooth headset, which can be 200ms+ behind on its own, and the result is
+/// audio that visibly trails the picture even though nothing in the mixer is
+/// slow.
+/// Custom selector — must match kAttenuatorProperty_DownstreamLatency in the
+/// driver. A custom one is required: the HAL rejects client writes to
+/// kAudioDevicePropertyLatency with 'nope' before they ever reach the driver.
+let kAttenuatorPropertyDownstreamLatency: AudioObjectPropertySelector = 0x61746C73  // 'atls'
+
+func publishDownstreamLatency(toDevice deviceID: AudioObjectID, frames: UInt32) -> OSStatus {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAttenuatorPropertyDownstreamLatency,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    // Custom plug-in properties travel as CFString or CFPropertyList only, so
+    // the frame count rides in a CFNumber rather than going across as a UInt32.
+    var value = CFNumberCreate(nil, .sInt32Type, [Int32(min(frames, UInt32(Int32.max)))]) as CFPropertyList?
+    return withUnsafeMutablePointer(to: &value) { ptr in
+        AudioObjectSetPropertyData(deviceID, &address, 0, nil,
+                                   UInt32(MemoryLayout<CFPropertyList?>.size), ptr)
+    }
+}

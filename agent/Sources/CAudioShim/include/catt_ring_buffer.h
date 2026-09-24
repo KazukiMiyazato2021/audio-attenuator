@@ -30,6 +30,13 @@ size_t catt_ring_buffer_write(CattRingBuffer* rb, const float* data, size_t fram
 // glitch-free buffer to hand to CoreAudio.
 size_t catt_ring_buffer_read(CattRingBuffer* rb, float* data, size_t frameCount);
 
+// Real-time safe: discards the oldest `frameCount` frames without copying
+// them. Used to claw back latency after a transient leaves more audio queued
+// than the pipeline should be carrying; without it any backlog picked up during
+// startup or a device switch stays as permanent added delay.
+// Returns the number of frames actually dropped.
+size_t catt_ring_buffer_drop(CattRingBuffer* rb, size_t frameCount);
+
 size_t catt_ring_buffer_available_for_read(const CattRingBuffer* rb);
 size_t catt_ring_buffer_available_for_write(const CattRingBuffer* rb);
 

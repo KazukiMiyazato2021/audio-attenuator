@@ -35,9 +35,11 @@ static const UInt32 kBitsPerChannel     = 32;
 static const UInt32 kBytesPerFrame      = kNumChannels * sizeof(Float32);
 static const UInt32 kBufferFrameSize    = 512;
 static const UInt32 kRingBufferFrames   = 65536;
-// How far behind the writer the reader is placed on resync: two IO periods
-// (~21ms at 48kHz), enough slack for IO-cycle jitter without adding audible lag.
-static const UInt32 kResyncSafetyFrames = 2 * kBufferFrameSize;
+// How far behind the writer the reader is placed on resync. Every frame here
+// is latency the whole pipeline carries, so it is kept to one IO period
+// (~11ms at 48kHz) — enough slack for the writer's and reader's IO cycles to
+// land in either order, without paying for more.
+static const UInt32 kResyncSafetyFrames = kBufferFrameSize;
 
 // Ring buffer for loopback
 static Float32 gRingBuffer[kRingBufferFrames * kNumChannels] = {};
@@ -72,6 +74,16 @@ struct DeviceState {
 
     Float32             volumeOutput;    // 0.0 - 1.0
     bool                muteOutput;
+
+    /// Latency of everything downstream of this device, in frames.
+    ///
+    /// Apps reading kAudioDevicePropertyLatency use it to line video up with
+    /// audio. This device is only the front door — the audio actually comes out
+    /// of whatever the mixer is playing through, and a Bluetooth headset can
+    /// add 200ms+ of its own. Reporting 0 makes every video player think audio
+    /// is instant and leaves it visibly out of sync. The mixer writes the real
+    /// figure here whenever its output device changes.
+    UInt32              downstreamLatency;
 };
 
 static DeviceState gDevice = {
@@ -87,6 +99,7 @@ static DeviceState gDevice = {
     .streamOutputActive = true,
     .volumeOutput       = 1.0f,
     .muteOutput         = false,
+    .downstreamLatency  = 0,
 };
 
 static AudioStreamBasicDescription gStreamFormat = {
@@ -379,6 +392,8 @@ static Boolean HasDeviceProperty(AudioObjectID, pid_t, const AudioObjectProperty
         case kAudioDevicePropertyZeroTimeStampPeriod:
         case kAudioDevicePropertyPreferredChannelsForStereo:
         case kAudioDevicePropertyPreferredChannelLayout:
+        case kAudioObjectPropertyCustomPropertyInfoList:
+        case kAttenuatorProperty_DownstreamLatency:
             return true;
         default:
             return false;
@@ -431,6 +446,12 @@ static OSStatus GetDevicePropertyDataSize(const AudioObjectPropertyAddress* addr
         case kAudioDevicePropertyIsHidden:
         case kAudioDevicePropertyZeroTimeStampPeriod:
             *outSize = sizeof(UInt32);
+            return kAudioHardwareNoError;
+        case kAudioObjectPropertyCustomPropertyInfoList:
+            *outSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+            return kAudioHardwareNoError;
+        case kAttenuatorProperty_DownstreamLatency:
+            *outSize = sizeof(CFPropertyListRef);
             return kAudioHardwareNoError;
         case kAudioDevicePropertyRelatedDevices:
             *outSize = sizeof(AudioObjectID);
@@ -544,6 +565,27 @@ static OSStatus GetDevicePropertyData(const AudioObjectPropertyAddress* addr, UI
             *ioSize = sizeof(UInt32);
             return kAudioHardwareNoError;
         case kAudioDevicePropertyLatency:
+            *((UInt32*)outData) = gDevice.downstreamLatency;
+            *ioSize = sizeof(UInt32);
+            return kAudioHardwareNoError;
+        case kAudioObjectPropertyCustomPropertyInfoList: {
+            // The HAL only forwards custom selectors it has been told about,
+            // and it only carries them as CFString or CFPropertyList — hence a
+            // CFNumber in a property list rather than a plain UInt32.
+            AudioServerPlugInCustomPropertyInfo* info = (AudioServerPlugInCustomPropertyInfo*)outData;
+            info->mSelector = kAttenuatorProperty_DownstreamLatency;
+            info->mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+            info->mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+            *ioSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+            return kAudioHardwareNoError;
+        }
+        case kAttenuatorProperty_DownstreamLatency: {
+            UInt32 value = gDevice.downstreamLatency;
+            CFNumberRef number = CFNumberCreate(NULL, kCFNumberSInt32Type, &value);
+            *((CFPropertyListRef*)outData) = number;   // caller releases
+            *ioSize = sizeof(CFPropertyListRef);
+            return kAudioHardwareNoError;
+        }
         case kAudioDevicePropertySafetyOffset:
             *((UInt32*)outData) = 0;
             *ioSize = sizeof(UInt32);
@@ -923,6 +965,16 @@ static void NotifyVolumeChanged(void) {
     });
 }
 
+static void NotifyLatencyChanged(void) {
+    if (!gPlugIn_Host) return;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        AudioObjectPropertyAddress addr = {
+            kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain
+        };
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Device, 1, &addr);
+    });
+}
+
 static void NotifyMuteChanged(void) {
     if (!gPlugIn_Host) return;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -974,6 +1026,14 @@ static OSStatus Attenuator_IsPropertySettable(AudioServerPlugInDriverRef d, Audi
             if (addr->mSelector == kAudioBooleanControlPropertyValue)
                 *outIsSettable = true;
             return kAudioHardwareNoError;
+        case kObjectID_Device:
+            // Writable so the mixer can publish the latency of whatever it is
+            // playing through; nothing else has any way to know it. It has to
+            // be our own selector: the HAL rejects client writes to
+            // kAudioDevicePropertyLatency before they reach the driver.
+            if (addr->mSelector == kAttenuatorProperty_DownstreamLatency)
+                *outIsSettable = true;
+            return kAudioHardwareNoError;
         default:
             return kAudioHardwareNoError;
     }
@@ -1020,6 +1080,17 @@ static OSStatus Attenuator_SetPropertyData(AudioServerPlugInDriverRef d, AudioOb
                 AudioObjectPropertyAddress propAddr = { kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
                 gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_PlugIn, 1, &propAddr);
             });
+        }
+        return kAudioHardwareNoError;
+    }
+    if (objectID == kObjectID_Device && addr->mSelector == kAttenuatorProperty_DownstreamLatency) {
+        CFPropertyListRef plist = *((const CFPropertyListRef*)inData);
+        if (plist && CFGetTypeID(plist) == CFNumberGetTypeID()) {
+            SInt32 value = 0;
+            if (CFNumberGetValue((CFNumberRef)plist, kCFNumberSInt32Type, &value) && value >= 0) {
+                gDevice.downstreamLatency = (UInt32)value;
+                NotifyLatencyChanged();
+            }
         }
         return kAudioHardwareNoError;
     }

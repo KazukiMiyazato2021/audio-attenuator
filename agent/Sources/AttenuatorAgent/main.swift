@@ -163,8 +163,7 @@ if let outputArg {
 guard let outputDeviceID = resolvedOutput else { exit(1) }
 print("Output device: \(getDeviceName(outputDeviceID))")
 
-trySetNominalSampleRate(outputDeviceID, rate: kSampleRate)
-
+// Left at the device's own rate on purpose — see MixerController.
 guard let outFormat = queryStreamFormat(outputDeviceID, scope: kAudioObjectPropertyScopeOutput) else {
     FileHandle.standardError.write("Could not read output device's stream format.\n".data(using: .utf8)!)
     exit(1)

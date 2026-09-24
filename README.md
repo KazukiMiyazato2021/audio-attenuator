@@ -13,7 +13,7 @@ macOS用の仮想オーディオドライバ + アプリ単位音量ミキサー
 
 **重要**: アプリ単位音量はシステム音声キャプチャ権限を必要とし、その権限はエージェントが
 launchd経由で起動されている場合にのみ適用される。ターミナルから直接起動するとタップは
-エラーなく無音を返す。詳細は [docs/PROCESS-TAPS.md](docs/PROCESS-TAPS.md)。
+エラーなく無音を返す。詳細は [docs/](docs/Home.md) の知見ノートを参照。
 
 ## 必要環境
 
@@ -127,7 +127,7 @@ audio-attenuator/
 ├── testtools/                  # 検証用トーン生成
 ├── scripts/
 └── docs/
-    └── PROCESS-TAPS.md         # Process Tapの実地調査結果
+    └── Home.md                 # 開発知見(Obsidian形式のノート群)の目次
 ```
 
 ## ライセンス
